@@ -1,6 +1,7 @@
-import { buildBackup, countRecords, toCsv, validateBackup } from "./backup.js";
+import { buildBackup, countRecords, profileFrom, toCsv, validateBackup } from "./backup.js";
 import { bandColor, destroyCharts, drawChart } from "./charts.js";
-import { clearStores, dump, list, newId, put, remove, removeSample, stamp, writeAll } from "./db.js";
+import { CATALOG, PANELS, QUAL_CHOICES, findTest, panelLabel, testsFor } from "./catalog.js";
+import { clearStores, dump, list, newId, put, putMany, remove, removeSample, stamp, writeAll } from "./db.js";
 import { saveFile } from "./files.js";
 import {
   bmi,
@@ -17,15 +18,16 @@ import {
   todayISO,
   withinRange,
 } from "./format.js";
+import { displayValue, interpret } from "./interpret.js";
+import { matchTest, specimenFromName } from "./match.js";
 import { recognizeImage } from "./ocr.js";
 import { parseLabReport, parseRange } from "./parser.js";
-import { assessBmi, assessBp, assessGlucose, assessLab, isFlagged, seriesKey, trendNote } from "./ranges.js";
+import { assessBmi, assessBp, assessGlucose, isFlagged, trendNote } from "./ranges.js";
 import { buildSample } from "./sample.js";
 
 const SETTINGS_KEY = "healthlog.settings";
-const VIEWS = ["home", "add", "scan", "trends", "more"];
-const TYPE_STORE = {
-  lab: "labs",
+const VIEWS = ["home", "panels", "add", "scan", "test", "more"];
+const VITALS = {
   bp: "bp",
   weight: "weights",
   glucose: "glucose",
@@ -34,36 +36,38 @@ const TYPE_STORE = {
 };
 
 let settings = loadSettings();
-let currentType = "lab";
+let currentType = "report";
+let openTestId = "";
 let trendRange = "1y";
 let renderToken = 0;
 let toastTimer = 0;
+let reportBuiltFor = null;
 
 function loadSettings() {
-  const defaults = { theme: "system", glucoseUnit: "mmol/L", heightCm: "", hintDismissed: false };
+  const defaults = profileFrom({});
   try {
-    const raw = localStorage.getItem(SETTINGS_KEY);
-    return raw ? { ...defaults, ...JSON.parse(raw) } : defaults;
+    return profileFrom({ ...defaults, ...JSON.parse(localStorage.getItem(SETTINGS_KEY) || "{}") });
   } catch {
     return defaults;
   }
 }
 
 function saveSettings() {
-  try {
-    localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings));
-  } catch {
-    /* Private mode can refuse storage; records still use IndexedDB for this tab. */
-  }
+  try { localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings)); } catch { /* private mode */ }
 }
 
-function resolvedTheme() {
-  if (settings.theme === "light" || settings.theme === "dark") return settings.theme;
-  return matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+function showPatientName() {
+  const node = document.getElementById("patient-name");
+  const name = String(settings.patientName || "").trim();
+  node.textContent = name;
+  node.hidden = !name;
 }
 
 function applyTheme() {
-  const theme = resolvedTheme();
+  const theme = settings.theme === "light" || settings.theme === "dark"
+    ? settings.theme
+    : (matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light");
+  showPatientName();
   document.documentElement.dataset.theme = theme;
   const meta = document.getElementById("theme-color");
   if (meta) meta.setAttribute("content", theme === "dark" ? "#101615" : "#0f6e6b");
@@ -94,9 +98,7 @@ function toast(message) {
   node.textContent = message;
   node.hidden = false;
   clearTimeout(toastTimer);
-  toastTimer = setTimeout(() => {
-    node.hidden = true;
-  }, 3600);
+  toastTimer = setTimeout(() => { node.hidden = true; }, 3600);
 }
 
 function openModal({ title, body, actions }) {
@@ -111,16 +113,9 @@ function openModal({ title, body, actions }) {
       document.removeEventListener("keydown", onKey);
       resolve(value);
     };
-    const onKey = (event) => {
-      if (event.key === "Escape") close("cancel");
-    };
+    const onKey = (event) => { if (event.key === "Escape") close("cancel"); };
     actions.forEach((action) => {
-      const button = el("button", {
-        type: "button",
-        class: action.className,
-        text: action.label,
-        "data-testid": action.id,
-      });
+      const button = el("button", { type: "button", class: action.className, text: action.label, "data-testid": action.id });
       button.addEventListener("click", () => close(action.value));
       host.append(button);
     });
@@ -132,32 +127,18 @@ function openModal({ title, body, actions }) {
 
 function setFormError(form, message) {
   const node = form.querySelector(".form-error");
+  if (!node) return;
   node.textContent = message || "";
   node.hidden = !message;
 }
 
-function setEditing(form, on) {
-  const button = form.querySelector('[type="submit"]');
-  button.textContent = on ? "Update" : button.dataset.label;
-  const cancel = form.querySelector("[data-cancel-edit]");
-  if (cancel) cancel.hidden = !on;
+function pill(view) {
+  if (!view) return null;
+  return el("span", { class: `pill ${view.level}`, text: view.title });
 }
 
-function resetForm(form) {
-  form.reset();
-  delete form.dataset.editing;
-  setEditing(form, false);
-  setFormError(form, "");
-  const firstDate = form.querySelector('input[type="date"], input[type="datetime-local"]');
-  if (firstDate) firstDate.value = firstDate.type === "date" ? todayISO() : nowLocalInput();
-  if (form.dataset.form === "glucose") {
-    const unit = form.querySelector('[name="unit"]');
-    unit.value = settings.glucoseUnit || "mmol/L";
-    unit.dataset.prev = unit.value;
-  }
-  if (form.dataset.form === "weight" && settings.heightCm) {
-    form.heightCm.value = settings.heightCm;
-  }
+function profile() {
+  return { sex: settings.sex, dob: settings.dob, cvRisk: settings.cvRisk };
 }
 
 function showView(name) {
@@ -165,13 +146,20 @@ function showView(name) {
   document.querySelectorAll("[data-view]").forEach((section) => {
     section.hidden = section.dataset.view !== view;
   });
-  document.querySelectorAll('[role="tab"]').forEach((tab) => {
-    tab.setAttribute("aria-selected", tab.dataset.tab === view ? "true" : "false");
+  document.querySelectorAll("[role=tab]").forEach((tab) => {
+    const on = tab.dataset.tab === view || (view === "test" && tab.dataset.tab === "panels");
+    tab.setAttribute("aria-selected", on ? "true" : "false");
   });
-  if (location.hash !== `#${view}`) history.replaceState(null, "", `#${view}`);
+  const hash = view === "test" && openTestId ? `#test/${openTestId}` : `#${view}`;
+  if (location.hash !== hash) history.replaceState(null, "", hash);
   if (view === "home") renderHome();
-  if (view === "add") renderEntryList();
-  if (view === "trends") renderTrends();
+  if (view === "panels") renderPanels();
+  if (view === "test") renderTest();
+  if (view === "add") {
+    const patient = document.getElementById("report-patient");
+    if (patient && !patient.value && settings.patientName) patient.value = settings.patientName;
+    renderEntryList();
+  }
   if (view === "more") syncSettingsForm();
 }
 
@@ -180,19 +168,17 @@ function setAddType(type) {
   document.querySelectorAll(".type-grid [data-type]").forEach((button) => {
     button.setAttribute("aria-pressed", button.dataset.type === type ? "true" : "false");
   });
-  document.querySelectorAll("form[data-form]").forEach((form) => {
-    const on = form.dataset.form === type;
-    form.hidden = !on;
-    if (!on) resetForm(form);
-    if (on && type === "glucose" && !form.dataset.editing) {
-      const input = form.querySelector('[name="value"]');
-      const unit = form.querySelector('[name="unit"]');
-      if (input && unit && !input.value) {
-        unit.value = settings.glucoseUnit || "mmol/L";
-        unit.dataset.prev = unit.value;
-      }
-    }
+  document.querySelectorAll("#view-add form").forEach((form) => {
+    form.hidden = form.dataset.form !== type;
   });
+  if (type === "report") {
+    buildReportForm().catch((err) => {
+      const host = document.getElementById("report-fields");
+      if (host) host.textContent = err && err.message ? err.message : "Could not list the screening tests.";
+    });
+    const patient = document.getElementById("report-patient");
+    if (patient && !patient.value && settings.patientName) patient.value = settings.patientName;
+  }
   renderEntryList();
 }
 
@@ -204,44 +190,27 @@ function glucoseUnit() {
   return settings.glucoseUnit === "mg/dL" ? "mg/dL" : "mmol/L";
 }
 
-function displayGlucoseNumber(mmol) {
-  return glucoseUnit() === "mg/dL" ? Number(mmol) * GLUCOSE_FACTOR : Number(mmol);
-}
-
 function latestOf(records) {
   return byDateDesc(records)[0] || null;
-}
-
-function groupLabs(records) {
-  const groups = new Map();
-  records.forEach((record) => {
-    const key = seriesKey(record.testName, record.unit);
-    if (!groups.has(key)) groups.set(key, []);
-    groups.get(key).push(record);
-  });
-  return [...groups.values()].map((rows) => byDateAsc(rows));
-}
-
-function pill(assessment) {
-  if (!assessment) return null;
-  return el("span", { class: `pill ${assessment.level}`, text: assessment.title });
 }
 
 async function renderHome() {
   const token = ++renderToken;
   const data = await dump();
   if (token !== renderToken) return;
+  destroyCharts();
   const seek = document.getElementById("seek-slot");
   const hint = document.getElementById("hint-slot");
   const body = document.getElementById("home-body");
   seek.replaceChildren();
   hint.replaceChildren();
   body.replaceChildren();
-
+  const tests = testsFor(data.customTests);
+  const total = data.results.length + data.bp.length + data.weights.length + data.glucose.length + data.meds.length + data.visits.length;
   if (!settings.hintDismissed) {
     const card = el("article", { class: "card hint" }, [
       el("h2", { text: "Add HealthLog to your Home Screen" }),
-      el("p", { text: "In Safari, tap Share, then Add to Home Screen, then open the new icon. Your records stay on this iPhone. Someone else who opens the link gets an empty tracker." }),
+      el("p", { text: "In Safari, tap Share, then Add to Home Screen. Records stay on this iPhone. Someone else who opens the link gets an empty tracker." }),
       el("button", { type: "button", class: "btn-secondary", text: "Hide this hint", "data-testid": "dismiss-hint" }),
     ]);
     card.querySelector("button").addEventListener("click", () => {
@@ -251,655 +220,622 @@ async function renderHome() {
     });
     hint.append(card);
   }
-
-  const total = Object.values(data).reduce((sum, rows) => sum + rows.length, 0);
   if (!total) {
     body.append(el("article", { class: "card", "data-testid": "home-empty" }, [
       el("h2", { text: "No records yet" }),
-      el("p", { text: "Add a reading, scan a printed report, or open More to load fictional sample data. Nothing is stored until you do." }),
+      el("p", { text: "Add a screening report, scan a printed page, or open More to load fictional sample data." }),
     ]));
     return;
   }
-
   const alerts = [];
   const latestBp = latestOf(data.bp);
-  const bpAssess = latestBp ? assessBp(latestBp) : null;
-  if (bpAssess?.seekCare) alerts.push(`Blood pressure ${latestBp.systolic}/${latestBp.diastolic}. ${bpAssess.detail}`);
+  const bpView = latestBp ? assessBp(latestBp) : null;
+  if (bpView?.seekCare) alerts.push(`Blood pressure ${latestBp.systolic}/${latestBp.diastolic}. ${bpView.detail}`);
   const latestGlucose = latestOf(data.glucose);
-  const glucoseAssess = latestGlucose ? assessGlucose(latestGlucose) : null;
-  if (glucoseAssess?.seekCare) {
-    alerts.push(`Blood sugar ${formatGlucose(latestGlucose.mmol, glucoseUnit())} ${glucoseUnit()}. ${glucoseAssess.detail}`);
-  }
-  groupLabs(data.labs).forEach((series) => {
-    const latest = series[series.length - 1];
-    const assessment = assessLab(latest);
-    if (assessment.seekCare) alerts.push(`${latest.testName} ${latest.value} ${latest.unit}. ${assessment.detail}`);
+  const glucoseView = latestGlucose ? assessGlucose(latestGlucose) : null;
+  if (glucoseView?.seekCare) alerts.push(`Blood sugar ${formatGlucose(latestGlucose.mmol, glucoseUnit())} ${glucoseUnit()}. ${glucoseView.detail}`);
+  const latestByTest = new Map();
+  byDateAsc(data.results).forEach((row) => latestByTest.set(row.testId, row));
+  latestByTest.forEach((row) => {
+    const view = interpret(findTest(row.testId, tests), row, profile());
+    if (view.seekCare) alerts.push(`${row.name || row.testId}: ${displayValue(row)}. ${view.guidance}`);
   });
   if (alerts.length) {
     const box = el("div", { class: "stack", "data-testid": "seek-care" });
-    alerts.forEach((text) => {
-      box.append(el("div", { class: "seek" }, [
-        el("strong", { text: "Seek medical care promptly" }),
-        el("p", { text }),
-        el("p", { text: "HealthLog cannot tell whether this is an emergency. If you feel very unwell, contact local emergency services (999 in Malaysia)." }),
-      ]));
-    });
+    alerts.forEach((text) => box.append(el("div", { class: "seek" }, [
+      el("strong", { text: "Seek medical care promptly" }),
+      el("p", { text }),
+    ])));
     seek.append(box);
   }
-
+  const follow = data.followups.filter((item) => !item.done && item.date);
+  if (follow.length) {
+    const card = el("section", { class: "card", "data-testid": "followups" }, [el("h2", { text: "Follow-ups" })]);
+    byDateAsc(follow).forEach((item) => {
+      const test = findTest(item.testId, tests);
+      const when = item.date < todayISO() ? "Overdue" : "Upcoming";
+      card.append(el("p", { text: `${when} ${formatWhen(item.date)} · ${item.action}${test ? ` · ${test.name}` : ""}` }));
+    });
+    body.append(card);
+  }
   const latestWrap = el("div", { class: "stack" }, [el("h2", { text: "Latest" })]);
   if (latestBp) {
-    const note = trendNote(byDateAsc(data.bp).map((row) => row.systolic));
-    latestWrap.append(metricCard("home-bp", "Blood pressure", `${latestBp.systolic}/${latestBp.diastolic}`, `mmHg · ${formatWhen(latestBp.date)}${latestBp.pulse ? ` · pulse ${latestBp.pulse}` : ""}`, bpAssess, note, latestBp.sample));
+    latestWrap.append(metricCard("home-bp", "Blood pressure", `${latestBp.systolic}/${latestBp.diastolic}`, `mmHg · ${formatWhen(latestBp.date)}`, bpView, trendNote(byDateAsc(data.bp).map((row) => row.systolic)), latestBp.sample));
   }
   if (latestGlucose) {
-    const note = trendNote(byDateAsc(data.glucose).map((row) => row.mmol));
-    const context = { fasting: "Fasting", before: "Before meal", after: "After meal", random: "Random" }[latestGlucose.context] || "";
-    latestWrap.append(metricCard("home-glucose", "Blood sugar", `${formatGlucose(latestGlucose.mmol, glucoseUnit())} ${glucoseUnit()}`, `${context} · ${formatWhen(latestGlucose.date)}`, glucoseAssess, note, latestGlucose.sample));
+    latestWrap.append(metricCard("home-glucose", "Blood sugar", `${formatGlucose(latestGlucose.mmol, glucoseUnit())} ${glucoseUnit()}`, formatWhen(latestGlucose.date), glucoseView, trendNote(byDateAsc(data.glucose).map((row) => row.mmol)), latestGlucose.sample));
   }
   const latestWeight = latestOf(data.weights);
   if (latestWeight) {
-    const height = heightFor(latestWeight);
-    const bmiAssess = assessBmi(latestWeight.kg, height);
-    const bmiText = bmiAssess.bmi ? ` · BMI ${formatBmi(bmiAssess.bmi)}` : " · add a height for BMI";
-    const note = trendNote(byDateAsc(data.weights).map((row) => row.kg));
-    latestWrap.append(metricCard("home-weight", "Weight", `${latestWeight.kg} kg`, `${formatWhen(latestWeight.date)}${bmiText}`, bmiAssess, note, latestWeight.sample));
+    const bmiView = assessBmi(latestWeight.kg, heightFor(latestWeight));
+    latestWrap.append(metricCard("home-weight", "Weight", `${latestWeight.kg} kg`, `${formatWhen(latestWeight.date)}${bmiView.bmi ? ` · BMI ${formatBmi(bmiView.bmi)}` : ""}`, bmiView, "", latestWeight.sample));
   }
-  const labSeries = groupLabs(data.labs).sort((a, b) => String(b[b.length - 1].date).localeCompare(String(a[a.length - 1].date)));
-  const labHost = el("div", { class: "stack", "data-testid": "home-labs" });
-  labSeries.slice(0, 6).forEach((series) => {
-    const latest = series[series.length - 1];
-    const assessment = assessLab(latest);
-    const note = trendNote(series.map((row) => row.value));
-    labHost.append(metricCard("", latest.testName, `${latest.value} ${latest.unit}`, formatWhen(latest.date), assessment, note, latest.sample));
-  });
-  if (labHost.childNodes.length) latestWrap.append(labHost);
   body.append(latestWrap);
-
-  const flagged = [];
-  if (bpAssess && isFlagged(bpAssess.level)) flagged.push(["Blood pressure", bpAssess]);
-  if (glucoseAssess && isFlagged(glucoseAssess.level)) flagged.push(["Blood sugar", glucoseAssess]);
-  if (latestWeight) {
-    const bmiAssess = assessBmi(latestWeight.kg, heightFor(latestWeight));
-    if (isFlagged(bmiAssess.level)) flagged.push(["BMI", bmiAssess]);
+  if (data.bp.length || data.weights.length || data.glucose.length) {
+    const trends = el("details", { class: "panel", open: true }, [el("summary", { text: "Vitals over time" })]);
+    const segment = el("div", { class: "segment", style: "margin:8px 0" });
+    [["3m", "3m"], ["6m", "6m"], ["1y", "1y"], ["all", "All"]].forEach(([id, label]) => {
+      const button = el("button", { type: "button", text: label, "data-vital-range": id, "aria-pressed": trendRange === id ? "true" : "false" });
+      button.addEventListener("click", () => { trendRange = id; renderHome(); });
+      segment.append(button);
+    });
+    trends.append(segment);
+    const host = el("div", { class: "stack", id: "vital-charts" });
+    trends.append(host);
+    body.append(trends);
+    mountVitalCharts(host, data);
   }
-  labSeries.forEach((series) => {
-    const latest = series[series.length - 1];
-    const assessment = assessLab(latest);
-    if (isFlagged(assessment.level)) flagged.push([latest.testName, assessment]);
+  const flagged = [];
+  latestByTest.forEach((row) => {
+    const view = interpret(findTest(row.testId, tests), row, profile());
+    if (isFlagged(view.level)) flagged.push([row, view]);
   });
   if (flagged.length) {
     const section = el("section", { class: "stack", "data-testid": "flagged" }, [el("h2", { text: "About these flags" })]);
-    flagged.forEach(([name, assessment]) => {
+    flagged.slice(0, 8).forEach(([row, view]) => {
       section.append(el("article", { class: "card" }, [
-        el("div", { class: "row-between" }, [el("h3", { text: name }), pill(assessment)]),
-        el("p", { class: "muted", text: assessment.rangeLabel }),
-        el("p", { class: "guidance", text: assessment.guidance }),
+        el("div", { class: "row-between" }, [el("h3", { text: row.name || row.testId }), pill(view)]),
+        el("p", { class: "muted", text: `${displayValue(row)} · ${formatWhen(row.date)}` }),
+        view.tierLabel ? el("p", { text: view.tierLabel }) : null,
+        el("p", { class: "guidance", text: view.guidance }),
       ]));
-    });
-    body.append(section);
-  }
-
-  const activeMeds = data.meds.filter((med) => {
-    const today = todayISO();
-    if (med.start && med.start > today) return false;
-    if (med.end && med.end < today) return false;
-    return true;
-  });
-  if (activeMeds.length) {
-    const section = el("section", { class: "card" }, [el("h2", { text: "Medications" })]);
-    activeMeds.forEach((med) => {
-      section.append(el("p", { text: `${med.name}${med.dose ? ` · ${med.dose}` : ""}${med.frequency ? ` · ${med.frequency}` : ""}${med.sample ? " · Sample" : ""}` }));
-    });
-    body.append(section);
-  }
-
-  const followUps = data.visits
-    .filter((visit) => visit.followUp && visit.followUp >= todayISO())
-    .sort((a, b) => a.followUp.localeCompare(b.followUp));
-  if (followUps.length) {
-    const section = el("section", { class: "card" }, [el("h2", { text: "Follow-ups" })]);
-    followUps.forEach((visit) => {
-      section.append(el("p", { text: `${formatWhen(visit.followUp)} · ${visit.doctor || visit.reason || "Visit"}${visit.sample ? " · Sample" : ""}` }));
     });
     body.append(section);
   }
 }
 
-function metricCard(testId, title, value, meta, assessment, note, sample) {
-  return el("article", { class: "card", "data-testid": testId || null }, [
-    el("div", { class: "row-between" }, [
-      el("h3", { text: title }),
-      pill(assessment),
-    ]),
+function metricCard(testId, title, value, meta, view, note, sample) {
+  return el("article", { class: "card", "data-testid": testId }, [
+    el("div", { class: "row-between" }, [el("h3", { text: title }), pill(view)]),
     sample ? el("p", { class: "sample-tag", text: "Sample" }) : null,
     el("p", { class: "metric", text: value }),
     el("p", { class: "muted", text: meta }),
-    assessment?.rangeLabel ? el("p", { class: "muted", text: assessment.rangeLabel }) : null,
-    note ? el("p", { class: "trend-note", text: note, "data-testid": "trend-note" }) : null,
+    view?.rangeLabel ? el("p", { class: "muted", text: view.rangeLabel }) : null,
+    note ? el("p", { class: "trend-note", text: note }) : null,
   ]);
+}
+
+function mountVitalCharts(host, data) {
+  const inRange = (row) => withinRange(row.date, trendRange);
+  const add = (title, testId, labels, dataPoints, yTitle) => {
+    if (!dataPoints.length) return;
+    const canvas = el("canvas", { "data-testid": testId });
+    const card = el("article", { class: "card" }, [el("h3", { text: title }), el("div", { class: "chart-box" }, [canvas])]);
+    host.append(card);
+    drawChart(canvas, {
+      labels,
+      yTitle,
+      datasets: [{ label: title, data: dataPoints, borderColor: cssVar("--chart-1"), backgroundColor: cssVar("--chart-1") }],
+    });
+  };
+  const bp = byDateAsc(data.bp.filter(inRange));
+  if (bp.length) {
+    const labels = bp.map((row) => chartLabel(row.date, bp.map((item) => item.date)));
+    const canvas = el("canvas", { "data-testid": "chart-bp" });
+    const card = el("article", { class: "card" }, [el("h3", { text: "Blood pressure" }), el("div", { class: "chart-box" }, [canvas])]);
+    host.append(card);
+    drawChart(canvas, {
+      labels,
+      yTitle: "mmHg",
+      datasets: [
+        { label: "Systolic", data: bp.map((row) => row.systolic), borderColor: cssVar("--chart-1"), backgroundColor: cssVar("--chart-1") },
+        { label: "Diastolic", data: bp.map((row) => row.diastolic), borderColor: cssVar("--chart-2"), backgroundColor: cssVar("--chart-2") },
+      ],
+    });
+  }
+  const weights = byDateAsc(data.weights.filter(inRange));
+  add("Weight", "chart-weight", weights.map((row) => chartLabel(row.date, weights.map((item) => item.date))), weights.map((row) => row.kg), "kg");
+  const glucose = byDateAsc(data.glucose.filter(inRange));
+  add("Blood sugar", "chart-glucose", glucose.map((row) => chartLabel(row.date, glucose.map((item) => item.date))), glucose.map((row) => glucoseUnit() === "mg/dL" ? row.mmol * GLUCOSE_FACTOR : row.mmol), glucoseUnit());
+}
+
+function sparkline(values) {
+  const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+  svg.setAttribute("viewBox", "0 0 72 28");
+  svg.setAttribute("class", "spark");
+  svg.setAttribute("aria-hidden", "true");
+  if (values.length < 2) return svg;
+  const min = Math.min(...values);
+  const max = Math.max(...values);
+  const span = max - min || 1;
+  const points = values.map((value, index) => {
+    const x = 2 + (index / (values.length - 1)) * 68;
+    const y = 26 - ((value - min) / span) * 22;
+    return `${x.toFixed(1)},${y.toFixed(1)}`;
+  }).join(" ");
+  const line = document.createElementNS(svg.namespaceURI, "polyline");
+  line.setAttribute("points", points);
+  line.setAttribute("fill", "none");
+  line.setAttribute("stroke", "currentColor");
+  line.setAttribute("stroke-width", "2");
+  svg.append(line);
+  return svg;
+}
+
+async function renderPanels() {
+  const data = await dump();
+  const tests = testsFor(data.customTests);
+  const root = document.getElementById("panel-root");
+  root.replaceChildren();
+  const latestReport = latestOf(data.reports.map((report) => ({ ...report, date: report.dateCollected })));
+  const tools = el("article", { class: "card stack" }, [el("h2", { text: "Screening checklist" })]);
+  const select = el("select", { id: "checklist-report", "data-testid": "checklist-report" });
+  select.append(el("option", { value: "", text: "Choose a report" }));
+  byDateDesc(data.reports.map((report) => ({ ...report, date: report.dateCollected }))).forEach((report) => {
+    const option = el("option", { value: report.id, text: `${report.patientName || "Unnamed"} · ${formatWhen(report.dateCollected)} · ${report.lab || "Report"}${report.sample ? " · Sample" : ""}` });
+    if (latestReport && report.id === latestReport.id) option.selected = true;
+    select.append(option);
+  });
+  const summary = el("p", { "data-testid": "checklist", text: "Save a screening report to see which tests were filled." });
+  tools.append(select, summary);
+  root.append(tools);
+  const paintChecklist = () => {
+    const report = data.reports.find((item) => item.id === select.value);
+    if (!report) {
+      summary.textContent = data.reports.length ? "Choose a report." : "Save a screening report to see which tests were filled.";
+      return;
+    }
+    const ids = new Set(data.results.filter((row) => row.reportId === report.id).map((row) => row.testId));
+    const filled = tests.filter((item) => ids.has(item.id));
+    const missing = tests.filter((item) => item.panel !== "custom" && !ids.has(item.id));
+    const who = report.patientName || settings.patientName || "Unnamed";
+    summary.textContent = `${who}: ${filled.length} of ${tests.filter((item) => item.panel !== "custom").length} catalog tests on ${formatWhen(report.dateCollected)}.`;
+    let nameLine = tools.querySelector("[data-testid=report-patient-label]");
+    if (!nameLine) {
+      nameLine = el("p", { "data-testid": "report-patient-label" });
+      tools.insertBefore(nameLine, summary);
+    }
+    nameLine.textContent = report.patientName ? `Report for ${report.patientName}` : "This report has no patient name.";
+    let list = tools.querySelector(".check-miss");
+    if (!list) {
+      list = el("p", { class: "check-miss" });
+      tools.append(list);
+    }
+    list.textContent = missing.length ? `Not in this report: ${missing.slice(0, 8).map((item) => item.name).join(", ")}${missing.length > 8 ? "…" : ""}` : "Every catalog test has a result on this report.";
+  };
+  select.addEventListener("change", paintChecklist);
+  paintChecklist();
+  const byTest = new Map();
+  data.results.forEach((row) => {
+    if (!byTest.has(row.testId)) byTest.set(row.testId, []);
+    byTest.get(row.testId).push(row);
+  });
+  PANELS.forEach(([id, label]) => {
+    const group = tests.filter((item) => item.panel === id);
+    if (!group.length) return;
+    const any = group.some((item) => byTest.has(item.id));
+    const details = el("details", { class: "panel", "data-testid": `panel-${id}`, open: any || id === "custom" });
+    details.append(el("summary", { text: label }));
+    group.forEach((item) => {
+      const rows = byDateAsc(byTest.get(item.id) || []);
+      const latest = rows[rows.length - 1];
+      const view = latest ? interpret(item, latest, profile()) : null;
+      const button = el("button", { type: "button", class: "test-row", "data-testid": `panel-test-${item.id}` });
+      const copy = el("span", {}, [
+        el("strong", { text: item.name }),
+        el("span", { class: "muted", text: latest ? ` ${displayValue(latest)} · ${formatWhen(latest.date)}` : " No result yet" }),
+      ]);
+      button.append(copy);
+      const side = el("span", { class: "row-between" });
+      if (view) side.append(pill(view));
+      side.append(sparkline(rows.map((row) => row.numeric).filter((value) => value != null)));
+      button.append(side);
+      button.addEventListener("click", () => {
+        openTestId = item.id;
+        showView("test");
+      });
+      details.append(button);
+    });
+    root.append(details);
+  });
+  const custom = el("article", { class: "card stack" }, [
+    el("h2", { text: "Add a custom test" }),
+    el("label", { class: "field" }, ["Name", el("input", { id: "custom-name", "data-testid": "custom-name", autocomplete: "off" })]),
+    el("label", { class: "field" }, ["Unit", el("input", { id: "custom-unit", "data-testid": "custom-unit", placeholder: "mmol/L" })]),
+    el("button", { type: "button", class: "btn-secondary", id: "save-custom", "data-testid": "save-custom", text: "Save custom test" }),
+  ]);
+  custom.querySelector("#save-custom").addEventListener("click", async () => {
+    const name = custom.querySelector("#custom-name").value.trim();
+    if (!name) return toast("Add a name for the custom test.");
+    await put("customTests", {
+      id: `custom-${newId()}`,
+      name,
+      aliases: [name],
+      panel: "custom",
+      unit: custom.querySelector("#custom-unit").value.trim(),
+      resultType: "numeric",
+      ref: null,
+      about: "A test you added on this device.",
+      sample: false,
+    });
+    toast("Custom test saved on this device.");
+    renderPanels();
+  });
+  root.append(custom);
+}
+
+async function renderTest() {
+  const data = await dump();
+  destroyCharts();
+  const tests = testsFor(data.customTests);
+  const test = findTest(openTestId, tests);
+  const root = document.getElementById("test-root");
+  root.replaceChildren();
+  if (!test) {
+    root.append(el("p", { text: "That test is not on this device." }));
+    return;
+  }
+  const rows = byDateAsc(data.results.filter((row) => row.testId === test.id));
+  const latest = rows[rows.length - 1];
+  const view = latest ? interpret(test, latest, profile()) : null;
+  const report = latest ? data.reports.find((item) => item.id === latest.reportId) : null;
+  root.append(el("article", { class: "card" }, [
+    report?.patientName ? el("p", { "data-testid": "report-patient-label", text: `Report for ${report.patientName}` }) : null,
+    el("h2", { text: test.name }),
+    el("p", { text: test.about }),
+    latest ? el("p", { class: "metric", text: displayValue(latest) }) : el("p", { class: "muted", text: "No result yet." }),
+    view ? pill(view) : null,
+    view?.tierLabel ? el("p", { "data-testid": "tier", text: view.tierLabel }) : el("p", { "data-testid": "tier", text: view?.rangeLabel || "" }),
+    view?.guidance ? el("p", { class: "guidance", text: view.guidance }) : null,
+  ]));
+  const numbers = rows.filter((row) => row.numeric != null && !row.comparator);
+  if (numbers.length >= 2) {
+    const canvas = el("canvas", { "data-testid": "chart-lab" });
+    const card = el("article", { class: "card" }, [el("h3", { text: "History" }), el("div", { class: "chart-box" }, [canvas])]);
+    root.append(card);
+    drawChart(canvas, {
+      labels: numbers.map((row) => chartLabel(row.date, numbers.map((item) => item.date))),
+      yTitle: test.unit,
+      band: view?.band ? { ...view.band, color: bandColor() } : null,
+      datasets: [{
+        label: test.unit || "Value",
+        data: numbers.map((row) => row.numeric),
+        borderColor: cssVar("--chart-1"),
+        backgroundColor: cssVar("--chart-1"),
+      }],
+    });
+    const note = trendNote(numbers.map((row) => row.numeric));
+    if (note) card.append(el("p", { class: "trend-note", text: note }));
+  }
+  if (rows.length) {
+    const list = el("article", { class: "card" }, [el("h3", { text: "Saved results" })]);
+    byDateDesc(rows).forEach((row) => {
+      const line = el("div", { class: "entry" }, [
+        el("strong", { text: displayValue(row) }),
+        el("p", { class: "muted", text: formatWhen(row.date) }),
+        el("button", { type: "button", text: "Delete", "data-id": row.id }),
+      ]);
+      line.querySelector("button").addEventListener("click", async () => {
+        await remove("results", row.id);
+        toast("Deleted from this device.");
+        renderTest();
+      });
+      list.append(line);
+    });
+    root.append(list);
+  }
+  const follow = el("article", { class: "card stack" }, [
+    el("h3", { text: "Follow-up" }),
+    el("label", { class: "field" }, ["What to revisit", el("input", { id: "follow-action", "data-testid": "follow-action", placeholder: test.id === "hpylori" ? "For example: urea breath test" : "For example: repeat in 3–6 months" })]),
+    el("label", { class: "field" }, ["Date", el("input", { id: "follow-date", "data-testid": "follow-date", type: "date" })]),
+    el("button", { type: "button", class: "btn-primary", id: "save-follow", "data-testid": "save-follow", text: "Save follow-up" }),
+  ]);
+  follow.querySelector("#save-follow").addEventListener("click", async () => {
+    const action = follow.querySelector("#follow-action").value.trim();
+    const date = follow.querySelector("#follow-date").value;
+    if (!action || !date) return toast("Add a follow-up note and a date.");
+    await put("followups", stamp({
+      id: newId(), testId: test.id, resultId: latest?.id || "", reportId: latest?.reportId || "", action, date, notes: "", done: false, sample: false,
+    }));
+    toast("Follow-up saved on this device.");
+    showView("home");
+  });
+  root.append(follow);
+}
+
+function inputEl(testId, value = "") {
+  const input = el("input", { "data-testid": testId, inputmode: "decimal", autocomplete: "off" });
+  if (value) input.value = value;
+  return input;
+}
+
+function reportRow(test) {
+  const row = el("div", { class: "entry-line", "data-report-row": test.id });
+  row.append(el("span", { class: "name", text: `${test.name}${test.unit ? ` · ${test.unit}` : ""}` }));
+  if (test.resultType === "qualitative") {
+    const select = el("select", { "data-testid": `qual-${test.id}` });
+    select.style.gridColumn = "1 / -1";
+    select.append(el("option", { value: "", text: "—" }));
+    (QUAL_CHOICES[test.qualKind] || ["Negative", "Positive"]).forEach((choice) => select.append(el("option", { value: choice, text: choice })));
+    row.append(select);
+    return row;
+  }
+  if (test.resultType === "text") {
+    const input = inputEl(`entry-${test.id}`);
+    input.style.gridColumn = "1 / -1";
+    row.append(input);
+    return row;
+  }
+  const cmp = el("select", { "data-testid": `cmp-${test.id}` });
+  ["", "<", "<=", ">", ">="].forEach((op) => cmp.append(el("option", { value: op, text: op || "=" })));
+  row.append(cmp, inputEl(`entry-${test.id}`), el("span", { class: "muted", text: test.unit || "" }));
+  if (test.secondary) row.append(el("span", { class: "muted", text: test.secondary.label }), inputEl(`secondary-${test.id}`));
+  if (test.id === "glucose") {
+    const specimen = el("select", { "data-testid": "entry-glucose-specimen" });
+    [["", "Use report fasting"], ["fasting", "Fasting"], ["random", "Random"]].forEach(([value, label]) => specimen.append(el("option", { value, text: label })));
+    row.append(specimen);
+  }
+  return row;
+}
+
+async function buildReportForm() {
+  const custom = await list("customTests");
+  const key = custom.map((item) => item.id).join(",");
+  if (reportBuiltFor === key) return;
+  reportBuiltFor = key;
+  const host = document.getElementById("report-fields");
+  host.replaceChildren();
+  const tests = testsFor(custom);
+  PANELS.forEach(([id, label]) => {
+    const group = tests.filter((item) => item.panel === id);
+    if (!group.length) return;
+    const details = el("details", { class: "panel", open: true, "data-testid": `report-${id}` });
+    details.append(el("summary", { text: label }));
+    group.forEach((item) => details.append(reportRow(item)));
+    host.append(details);
+  });
+  const date = document.getElementById("report-date");
+  if (date && !date.value) date.value = todayISO();
+  const patient = document.getElementById("report-patient");
+  if (patient && !patient.value && settings.patientName) patient.value = settings.patientName;
+}
+
+function readReportRows(fasting) {
+  const rows = [];
+  document.querySelectorAll("[data-report-row]").forEach((row) => {
+    const id = row.dataset.reportRow;
+    const test = findTest(id) || { id, name: id, unit: "", resultType: "numeric" };
+    const numeric = num(row.querySelector(`[data-testid="entry-${id}"]`)?.value);
+    const qualitative = row.querySelector(`[data-testid="qual-${id}"]`)?.value || (test.resultType === "text" ? row.querySelector(`[data-testid="entry-${id}"]`)?.value.trim() : "");
+    const secondary = num(row.querySelector(`[data-testid="secondary-${id}"]`)?.value);
+    const comparator = row.querySelector(`[data-testid="cmp-${id}"]`)?.value || "";
+    if (numeric == null && !qualitative && secondary == null) return;
+    let specimen = "";
+    if (id === "glucose") {
+      specimen = row.querySelector("[data-testid=entry-glucose-specimen]")?.value || "";
+      if (!specimen) specimen = fasting === "yes" ? "fasting" : fasting === "no" ? "random" : "";
+    }
+    rows.push({ test, numeric, qualitative, secondary, comparator, specimen });
+  });
+  return rows;
+}
+
+async function saveReport(form) {
+  const date = form.dateCollected.value;
+  if (!date) throw new Error("Add the date the sample was collected.");
+  const fasting = form.fasting.value;
+  const entered = readReportRows(fasting);
+  if (!entered.length) throw new Error("Enter at least one result. Blank rows are skipped.");
+  const report = stamp({
+    id: newId(),
+    dateCollected: date,
+    patientName: form.patientName.value.trim() || settings.patientName || "",
+    lab: form.lab.value.trim(),
+    labNumber: form.labNumber.value.trim(),
+    doctor: form.doctor.value.trim(),
+    fasting: fasting === "yes" ? true : fasting === "no" ? false : null,
+    notes: form.notes.value.trim(),
+    sample: false,
+  });
+  const entries = [{ store: "reports", record: report }];
+  entered.forEach((item) => {
+    entries.push({ store: "results", record: stamp({
+      id: newId(),
+      testId: item.test.id,
+      name: item.test.name,
+      reportId: report.id,
+      date,
+      numeric: item.numeric,
+      comparator: item.comparator,
+      qualitative: item.qualitative || "",
+      unit: item.test.unit || "",
+      secondaryNumeric: item.secondary,
+      secondaryUnit: item.secondary != null ? (item.test.secondary?.unit || "") : "",
+      specimen: item.specimen,
+      refLow: null,
+      refHigh: null,
+      lowInclusive: true,
+      highInclusive: true,
+      refText: "",
+      flag: "",
+      notes: "",
+      sample: false,
+    }) });
+  });
+  await putMany(entries);
+  form.reset();
+  reportBuiltFor = null;
+  await buildReportForm();
+  toast(`Saved ${entered.length} results on this device.`);
+  showView("panels");
 }
 
 async function renderEntryList() {
   const host = document.getElementById("entry-list");
-  const rows = byDateDesc(await list(TYPE_STORE[currentType]));
+  if (!host || currentType === "report") {
+    if (host) host.replaceChildren(el("p", { class: "muted", text: currentType === "report" ? "Saved screening reports appear under Panels." : "" }));
+    return;
+  }
+  const rows = byDateDesc(await list(VITALS[currentType]));
   host.replaceChildren();
   if (!rows.length) {
     host.append(el("p", { class: "muted", text: "Nothing saved here yet." }));
     return;
   }
-  rows.forEach((row) => host.append(entryRow(row)));
+  rows.forEach((row) => {
+    let title = "";
+    if (currentType === "bp") title = `${row.systolic}/${row.diastolic}`;
+    else if (currentType === "weight") title = `${row.kg} kg`;
+    else if (currentType === "glucose") title = `${formatGlucose(row.mmol, glucoseUnit())} ${glucoseUnit()}`;
+    else if (currentType === "med") title = row.name;
+    else title = row.doctor || row.reason || "Visit";
+    const item = el("article", { class: "entry" }, [
+      el("strong", { text: title }),
+      el("p", { class: "muted", text: formatWhen(row.date || row.start) }),
+      el("div", { class: "entry-actions" }, [
+        el("button", { type: "button", text: "Edit", "data-action": "edit", "data-id": row.id }),
+        el("button", { type: "button", text: "Delete", "data-action": "delete", "data-id": row.id }),
+      ]),
+    ]);
+    host.append(item);
+  });
 }
 
-function entryRow(row) {
-  let title = "";
-  let detail = "";
-  if (currentType === "lab") {
-    const assessment = assessLab(row);
-    title = `${row.testName} · ${row.value} ${row.unit}`;
-    detail = `${formatWhen(row.date)} · ${assessment.title}`;
-  } else if (currentType === "bp") {
-    title = `${row.systolic}/${row.diastolic}${row.pulse ? ` · pulse ${row.pulse}` : ""}`;
-    detail = `${formatWhen(row.date)} · ${assessBp(row).title}`;
-  } else if (currentType === "weight") {
-    const value = bmi(row.kg, heightFor(row));
-    title = `${row.kg} kg${value ? ` · BMI ${formatBmi(value)}` : ""}`;
-    detail = formatWhen(row.date);
-  } else if (currentType === "glucose") {
-    title = `${formatGlucose(row.mmol, glucoseUnit())} ${glucoseUnit()} · ${row.context}`;
-    detail = formatWhen(row.date);
-  } else if (currentType === "med") {
-    title = row.name;
-    detail = [row.dose, row.frequency, row.start && `from ${formatWhen(row.start)}`, row.end && `until ${formatWhen(row.end)}`].filter(Boolean).join(" · ");
-  } else {
-    title = row.doctor || row.reason || "Visit";
-    detail = [formatWhen(row.date), row.reason, row.followUp && `follow-up ${formatWhen(row.followUp)}`].filter(Boolean).join(" · ");
+function setEditing(form, on) {
+  const button = form.querySelector("[type=submit]");
+  if (button?.dataset.label) button.textContent = on ? "Update" : button.dataset.label;
+  const cancel = form.querySelector("[data-cancel-edit]");
+  if (cancel) cancel.hidden = !on;
+}
+
+function resetVital(form) {
+  form.reset();
+  delete form.dataset.editing;
+  setEditing(form, false);
+  setFormError(form, "");
+  const date = form.querySelector('input[type="date"], input[type="datetime-local"]');
+  if (date) date.value = date.type === "date" ? todayISO() : nowLocalInput();
+  if (form.dataset.form === "glucose") {
+    const unit = form.querySelector('[name="unit"]');
+    unit.value = glucoseUnit();
+    unit.dataset.prev = unit.value;
   }
-  const item = el("article", { class: "entry" }, [
-    el("strong", { text: title }),
-    el("p", { class: "muted", text: detail }),
-    row.sample ? el("p", { class: "sample-tag", text: "Sample" }) : null,
-    el("div", { class: "entry-actions" }, [
-      el("button", { type: "button", text: "Edit", "data-action": "edit", "data-id": row.id }),
-      el("button", { type: "button", text: "Delete", "data-action": "delete", "data-id": row.id }),
-    ]),
-  ]);
-  return item;
+  if (form.dataset.form === "weight" && settings.heightCm) form.heightCm.value = settings.heightCm;
 }
 
-function formFor(type) {
-  return document.querySelector(`form[data-form="${type}"]`);
-}
-
-function startEdit(row) {
-  const form = formFor(currentType);
-  form.dataset.editing = row.id;
-  setEditing(form, true);
-  if (currentType === "lab") {
-    form.testName.value = row.testName;
-    form.value.value = row.value;
-    form.unit.value = row.unit || "";
-    form.refLow.value = row.refLow ?? "";
-    form.refHigh.value = row.refHigh ?? "";
-    form.refPrinted.value = row.refText || "";
-    form.flag.value = row.flag || "";
-    form.date.value = String(row.date).slice(0, 10);
-    form.lab.value = row.lab || "";
-    form.notes.value = row.notes || "";
-  } else if (currentType === "bp") {
-    form.systolic.value = row.systolic;
-    form.diastolic.value = row.diastolic;
-    form.pulse.value = row.pulse ?? "";
-    form.date.value = row.date.length === 10 ? `${row.date}T00:00` : row.date;
-    form.notes.value = row.notes || "";
-  } else if (currentType === "weight") {
-    form.kg.value = row.kg;
-    form.heightCm.value = row.heightCm ?? "";
-    form.date.value = row.date.length === 10 ? `${row.date}T00:00` : row.date;
-    form.notes.value = row.notes || "";
-  } else if (currentType === "glucose") {
-    const unit = glucoseUnit();
-    form.unit.value = unit;
-    form.unit.dataset.prev = unit;
-    form.value.value = formatGlucose(row.mmol, unit);
-    form.context.value = row.context;
-    form.date.value = row.date.length === 10 ? `${row.date}T00:00` : row.date;
-    form.notes.value = row.notes || "";
-  } else if (currentType === "med") {
-    form.name.value = row.name;
-    form.dose.value = row.dose || "";
-    form.frequency.value = row.frequency || "";
-    form.start.value = row.start || "";
-    form.end.value = row.end || "";
-    form.notes.value = row.notes || "";
-  } else {
-    form.date.value = String(row.date).slice(0, 10);
-    form.doctor.value = row.doctor || "";
-    form.reason.value = row.reason || "";
-    form.notes.value = row.notes || "";
-    form.followUp.value = row.followUp || "";
-  }
-  form.scrollIntoView({ block: "start" });
-}
-
-function rangeFromLabForm(form) {
-  let refLow = num(form.refLow.value);
-  let refHigh = num(form.refHigh.value);
-  let lowInclusive = true;
-  let highInclusive = true;
-  let flag = form.flag.value;
-  const printed = form.refPrinted.value.trim();
-  if (refLow == null && refHigh == null && printed) {
-    const parsed = parseRange(printed);
-    refLow = parsed.refLow;
-    refHigh = parsed.refHigh;
-    lowInclusive = parsed.lowInclusive;
-    highInclusive = parsed.highInclusive;
-    if (!flag) flag = parsed.flag;
-  }
-  return { refLow, refHigh, lowInclusive, highInclusive, refText: printed, flag };
-}
-
-async function saveForm(form) {
+async function saveVital(form) {
   const type = form.dataset.form;
-  const store = TYPE_STORE[type];
-  const existing = form.dataset.editing
-    ? (await list(store)).find((row) => row.id === form.dataset.editing)
-    : null;
+  const store = VITALS[type];
+  const existing = form.dataset.editing ? (await list(store)).find((row) => row.id === form.dataset.editing) : null;
   let record;
-  if (type === "lab") {
-    const testName = form.testName.value.trim();
-    const value = num(form.value.value);
-    if (!testName) throw new Error("Add the test name.");
-    if (value == null) throw new Error("Add a numeric result.");
-    if (!form.date.value) throw new Error("Add the date.");
-    const range = rangeFromLabForm(form);
-    record = {
-      id: existing?.id || newId(),
-      testName,
-      value,
-      unit: form.unit.value.trim(),
-      ...range,
-      date: form.date.value,
-      lab: form.lab.value.trim(),
-      notes: form.notes.value.trim(),
-      sample: existing?.sample || false,
-    };
-  } else if (type === "bp") {
+  if (type === "bp") {
     const systolic = num(form.systolic.value);
     const diastolic = num(form.diastolic.value);
     const pulse = num(form.pulse.value);
     if (systolic == null || diastolic == null) throw new Error("Add systolic and diastolic numbers.");
-    if (systolic < 60 || systolic > 260 || diastolic < 30 || diastolic > 180) {
-      throw new Error("Check those numbers. Systolic should be 60–260 and diastolic 30–180.");
-    }
-    if (systolic < diastolic) throw new Error("Systolic is usually higher than diastolic. Check the numbers.");
-    if (pulse != null && (pulse < 20 || pulse > 240)) throw new Error("Check the pulse, or leave it blank.");
-    record = {
-      id: existing?.id || newId(),
-      systolic,
-      diastolic,
-      pulse,
-      date: form.date.value,
-      notes: form.notes.value.trim(),
-      sample: existing?.sample || false,
-    };
+    if (systolic < 60 || systolic > 260 || diastolic < 30 || diastolic > 180) throw new Error("Check those blood pressure numbers.");
+    if (systolic < diastolic) throw new Error("Systolic is usually higher than diastolic.");
+    record = { id: existing?.id || newId(), systolic, diastolic, pulse, date: form.date.value, notes: form.notes.value.trim(), sample: existing?.sample || false };
   } else if (type === "weight") {
     const kg = num(form.kg.value);
     const heightCm = num(form.heightCm.value);
     if (kg == null || kg < 2 || kg > 400) throw new Error("Enter a weight in kilograms.");
-    if (heightCm != null && (heightCm < 50 || heightCm > 260)) throw new Error("Enter height in centimetres, or leave it blank.");
-    if (heightCm != null) {
-      settings.heightCm = heightCm;
-      saveSettings();
-    }
-    record = {
-      id: existing?.id || newId(),
-      kg,
-      heightCm,
-      date: form.date.value,
-      notes: form.notes.value.trim(),
-      sample: existing?.sample || false,
-    };
+    if (heightCm != null) { settings.heightCm = heightCm; saveSettings(); }
+    record = { id: existing?.id || newId(), kg, heightCm, date: form.date.value, notes: form.notes.value.trim(), sample: existing?.sample || false };
   } else if (type === "glucose") {
-    const unit = form.unit.value;
-    const mmol = glucoseToMmol(form.value.value, unit);
+    const mmol = glucoseToMmol(form.value.value, form.unit.value);
     if (mmol == null || mmol < 0.2 || mmol > 55) throw new Error("Check the blood sugar number.");
-    record = {
-      id: existing?.id || newId(),
-      mmol,
-      context: form.context.value,
-      date: form.date.value,
-      notes: form.notes.value.trim(),
-      sample: existing?.sample || false,
-    };
+    record = { id: existing?.id || newId(), mmol, context: form.context.value, date: form.date.value, notes: form.notes.value.trim(), sample: existing?.sample || false };
   } else if (type === "med") {
-    const name = form.name.value.trim();
-    if (!name) throw new Error("Add the medication name.");
-    record = {
-      id: existing?.id || newId(),
-      name,
-      dose: form.dose.value.trim(),
-      frequency: form.frequency.value.trim(),
-      start: form.start.value,
-      end: form.end.value,
-      notes: form.notes.value.trim(),
-      sample: existing?.sample || false,
-    };
+    if (!form.name.value.trim()) throw new Error("Add the medication name.");
+    record = { id: existing?.id || newId(), name: form.name.value.trim(), dose: form.dose.value.trim(), frequency: form.frequency.value.trim(), start: form.start.value, end: form.end.value, notes: form.notes.value.trim(), sample: existing?.sample || false };
   } else {
     if (!form.date.value) throw new Error("Add the visit date.");
-    record = {
-      id: existing?.id || newId(),
-      date: form.date.value,
-      doctor: form.doctor.value.trim(),
-      reason: form.reason.value.trim(),
-      notes: form.notes.value.trim(),
-      followUp: form.followUp.value,
-      sample: existing?.sample || false,
-    };
+    record = { id: existing?.id || newId(), date: form.date.value, doctor: form.doctor.value.trim(), reason: form.reason.value.trim(), notes: form.notes.value.trim(), followUp: form.followUp.value, sample: existing?.sample || false };
   }
   await put(store, stamp(record, existing));
-  resetForm(form);
+  resetVital(form);
   await renderEntryList();
   toast("Saved on this device.");
 }
 
-function pointColor(level) {
-  if (level === "critical") return cssVar("--chart-bad");
-  if (level === "high" || level === "low") return cssVar("--chart-flag");
-  return cssVar("--chart-normal");
-}
-
-function chartCard({ title, testId, labels, datasets, yTitle, band, caption, note, points }) {
-  const canvas = el("canvas", { "data-testid": testId, role: "img", "aria-label": title });
-  const box = el("div", { class: "chart-box" }, [canvas]);
-  const list = el("ol", { class: "point-list" });
-  points.slice(-6).forEach((point) => list.append(el("li", { text: point })));
-  const card = el("article", { class: "card" }, [
-    el("h2", { text: title }),
-    box,
-    caption ? el("p", { class: "muted", text: caption }) : null,
-    note ? el("p", { class: "trend-note", text: note }) : null,
-    list,
-  ]);
-  card._chart = { canvas, labels, datasets, yTitle, band };
-  return card;
-}
-
-function mountChart(card) {
-  if (!card._chart) return;
-  drawChart(card._chart.canvas, { ...card._chart, extras: [] });
-}
-
-async function renderTrends() {
-  const token = ++renderToken;
-  const data = await dump();
-  if (token !== renderToken) return;
-  destroyCharts();
-  const host = document.getElementById("trend-charts");
-  host.replaceChildren();
-  document.querySelectorAll(".segment [data-range]").forEach((button) => {
-    button.setAttribute("aria-pressed", button.dataset.range === trendRange ? "true" : "false");
+function optionGroups(select, tests, selected) {
+  select.append(el("option", { value: "", text: "Not in the catalog" }));
+  PANELS.forEach(([id, label]) => {
+    const group = tests.filter((item) => item.panel === id);
+    if (!group.length) return;
+    const opt = el("optgroup", { label });
+    group.forEach((item) => opt.append(el("option", { value: item.id, text: item.name })));
+    select.append(opt);
   });
-  const inRange = (row) => withinRange(row.date, trendRange);
-  let any = false;
-
-  const bp = byDateAsc(data.bp.filter(inRange));
-  if (bp.length) {
-    any = true;
-    const labels = bp.map((row) => chartLabel(row.date, bp.map((item) => item.date)));
-    const colors = bp.map((row) => pointColor(assessBp(row).level));
-    const bpCard = chartCard({
-      title: "Blood pressure",
-      testId: "chart-bp",
-      labels,
-      yTitle: "mmHg",
-      datasets: [
-        { label: "Systolic", data: bp.map((row) => row.systolic), borderColor: cssVar("--chart-1"), backgroundColor: cssVar("--chart-1"), pointBackgroundColor: colors },
-        { label: "Diastolic", data: bp.map((row) => row.diastolic), borderColor: cssVar("--chart-2"), backgroundColor: cssVar("--chart-2"), pointBackgroundColor: colors },
-      ],
-      caption: "General adult categories: normal under 120/80, high from 130/80, seek care at 180/120 or higher. No shaded band, because the two lines use different cutoffs.",
-      note: trendNote(bp.map((row) => row.systolic)).replace("Rising", "Systolic is rising").replace("Falling", "Systolic is falling"),
-      points: bp.map((row) => `${formatWhen(row.date)} · ${row.systolic}/${row.diastolic}`),
-    });
-    host.append(bpCard);
-    mountChart(bpCard);
-  }
-
-  const weights = byDateAsc(data.weights.filter(inRange));
-  if (weights.length) {
-    any = true;
-    const labels = weights.map((row) => chartLabel(row.date, weights.map((item) => item.date)));
-    const weightCard = chartCard({
-      title: "Weight",
-      testId: "chart-weight",
-      labels,
-      yTitle: "kg",
-      datasets: [{
-        label: "Weight",
-        data: weights.map((row) => row.kg),
-        borderColor: cssVar("--chart-1"),
-        backgroundColor: cssVar("--chart-1"),
-        pointBackgroundColor: weights.map((row) => pointColor(assessBmi(row.kg, heightFor(row)).level)),
-      }],
-      caption: "BMI uses the height saved with the reading, or the height in More.",
-      note: trendNote(weights.map((row) => row.kg)),
-      points: weights.map((row) => {
-        const value = bmi(row.kg, heightFor(row));
-        return `${formatWhen(row.date)} · ${row.kg} kg${value ? ` · BMI ${formatBmi(value)}` : ""}`;
-      }),
-    });
-    host.append(weightCard);
-    mountChart(weightCard);
-  }
-
-  const glucose = byDateAsc(data.glucose.filter(inRange));
-  if (glucose.length) {
-    any = true;
-    const unit = glucoseUnit();
-    const latest = assessGlucose(glucose[glucose.length - 1]);
-    const labels = glucose.map((row) => chartLabel(row.date, glucose.map((item) => item.date)));
-    const band = latest.band ? {
-      low: latest.band.low == null ? null : displayGlucoseNumber(latest.band.low),
-      high: latest.band.high == null ? null : displayGlucoseNumber(latest.band.high),
-      color: bandColor(),
-    } : null;
-    const glucoseCard = chartCard({
-      title: "Blood sugar",
-      testId: "chart-glucose",
-      labels,
-      yTitle: unit,
-      band,
-      datasets: [{
-        label: unit,
-        data: glucose.map((row) => displayGlucoseNumber(row.mmol)),
-        borderColor: cssVar("--chart-1"),
-        backgroundColor: cssVar("--chart-1"),
-        pointBackgroundColor: glucose.map((row) => pointColor(assessGlucose(row).level)),
-      }],
-      caption: `${latest.rangeLabel}. The shaded band follows the latest reading’s context. Very low is under 3.0 mmol/L and very high is 15 mmol/L or more.`,
-      note: trendNote(glucose.map((row) => row.mmol)),
-      points: glucose.map((row) => `${formatWhen(row.date)} · ${formatGlucose(row.mmol, unit)} ${unit} · ${row.context}`),
-    });
-    host.append(glucoseCard);
-    mountChart(glucoseCard);
-  }
-
-  groupLabs(data.labs).forEach((series) => {
-    if (series.length < 2) return;
-    const rows = series.filter(inRange);
-    if (!rows.length) return;
-    any = true;
-    const latest = rows[rows.length - 1];
-    const assessment = assessLab(latest);
-    const name = latest.testName.replace(/\s*\(SAMPLE\)/i, "");
-    const labels = rows.map((row) => chartLabel(row.date, rows.map((item) => item.date)));
-    const band = assessment.band && (assessment.band.low != null || assessment.band.high != null)
-      ? { low: assessment.band.low, high: assessment.band.high, color: bandColor() }
-      : null;
-    const labCard = chartCard({
-      title: name,
-      testId: "chart-lab",
-      labels,
-      yTitle: latest.unit || "",
-      band,
-      datasets: [{
-        label: latest.unit || "Value",
-        data: rows.map((row) => row.value),
-        borderColor: cssVar("--chart-1"),
-        backgroundColor: cssVar("--chart-1"),
-        pointBackgroundColor: rows.map((row) => pointColor(assessLab(row).level)),
-      }],
-      caption: assessment.rangeLabel,
-      note: trendNote(rows.map((row) => row.value)),
-      points: rows.map((row) => `${formatWhen(row.date)} · ${row.value} ${row.unit}`),
-    });
-    host.append(labCard);
-    mountChart(labCard);
-  });
-
-  if (!any) {
-    host.append(el("article", { class: "card" }, [
-      el("h2", { text: "No chart yet" }),
-      el("p", { text: "Charts appear after you save readings in this time range. Lab tests need at least two results." }),
-    ]));
-  }
+  select.value = selected || "";
 }
 
-function friendlyStatus(status) {
-  const text = String(status || "").toLowerCase();
-  if (text.includes("prepar")) return "Preparing the photo…";
-  if (text.includes("core")) return "Preparing the on-device reader…";
-  if (text.includes("language") || text.includes("trained")) return "Loading English text recognition…";
-  if (text.includes("initial")) return "Starting recognition…";
-  if (text.includes("recogn")) return "Reading the photo…";
-  return "Working…";
-}
-
-function showProgress(message, ratio) {
-  const wrap = document.getElementById("ocr-progress");
-  wrap.hidden = false;
-  wrap.querySelector("[data-testid=progress-label]").textContent = message;
-  const pct = Math.max(0, Math.min(100, Math.round((ratio || 0) * 100)));
-  wrap.querySelector("[data-testid=progress-bar]").style.width = `${pct}%`;
-}
-
-function hideProgress() {
-  document.getElementById("ocr-progress").hidden = true;
-}
-
-function setOcrError(message) {
-  const node = document.getElementById("ocr-error");
-  node.textContent = message || "";
-  node.hidden = !message;
-}
-
-function blankRow() {
-  return {
-    testName: "",
-    value: "",
-    unit: "",
-    refLow: "",
-    refHigh: "",
-    refText: "",
-    flag: "",
-    lowInclusive: true,
-    highInclusive: true,
-  };
-}
-
-function reviewRowElement(row) {
+function reviewRowElement(row, tests) {
+  const matched = matchTest(row.testName, tests);
   const card = el("div", { class: "review-row", "data-testid": "review-row" });
-  card.dataset.lowInclusive = row.lowInclusive === false ? "false" : "true";
-  card.dataset.highInclusive = row.highInclusive === false ? "false" : "true";
-  const name = field("Test", "text", row.testName, "row-name");
-  name.classList.add("span-2");
-  const value = field("Value", "text", row.value, "row-value");
-  value.querySelector("input").inputMode = "decimal";
-  const unit = field("Unit", "text", row.unit, "row-unit");
-  const low = field("Ref low", "text", row.refLow ?? "", "row-low");
-  const high = field("Ref high", "text", row.refHigh ?? "", "row-high");
-  low.querySelector("input").inputMode = "decimal";
-  high.querySelector("input").inputMode = "decimal";
-  const printed = field("Range as printed", "text", row.refText || "", "row-reftext");
-  printed.classList.add("span-2");
-  const flagWrap = el("label", { class: "field" }, ["Flag"]);
-  const flag = el("select", { "data-testid": "row-flag" });
-  [["", "None"], ["H", "H"], ["L", "L"]].forEach(([value, label]) => {
-    const option = el("option", { value, text: label });
-    if (value === (row.flag || "")) option.selected = true;
-    flag.append(option);
+  const name = el("input", { "data-testid": "row-name", value: row.testName || "" });
+  const select = el("select", { "data-testid": "row-test" });
+  optionGroups(select, tests, matched?.id || "");
+  const cmp = el("select", { "data-testid": "row-cmp" });
+  ["", "<", "<=", ">", ">="].forEach((op) => {
+    const option = el("option", { value: op, text: op || "=" });
+    if (op === (row.comparator || "")) option.selected = true;
+    cmp.append(option);
   });
-  flagWrap.append(flag);
-  const remove = el("button", { type: "button", class: "btn-secondary", text: "Remove row", "data-testid": "remove-row" });
-  const preview = el("p", { class: "muted span-2", "data-testid": "row-preview", text: previewText(row) });
-  [low, high].forEach((wrap) => {
-    wrap.querySelector("input").addEventListener("input", () => {
-      card.dataset.lowInclusive = "true";
-      card.dataset.highInclusive = "true";
-      preview.textContent = previewText(readOne(card));
-    });
-  });
-  card.addEventListener("input", () => {
-    preview.textContent = previewText(readOne(card));
-  });
-  remove.addEventListener("click", () => {
-    const rows = readReviewRows().filter((item) => item.el !== card);
-    renderReview(rows);
-  });
-  card.append(name, value, unit, low, high, printed, flagWrap, remove, preview);
+  const value = el("input", { "data-testid": "row-value", inputmode: "decimal", value: row.value ?? "" });
+  const unit = el("input", { "data-testid": "row-unit", value: row.unit || matched?.unit || "" });
+  const qual = el("input", { "data-testid": "row-qual", placeholder: "Negative, Clear…", value: row.qualitative || "" });
+  const secondary = el("input", { "data-testid": "row-secondary", inputmode: "decimal", value: row.secondary ?? "" });
+  const low = el("input", { "data-testid": "row-low", inputmode: "decimal", value: row.refLow ?? "" });
+  const high = el("input", { "data-testid": "row-high", inputmode: "decimal", value: row.refHigh ?? "" });
+  const preview = el("p", { class: "muted span-2", "data-testid": "row-preview" });
+  const refresh = () => {
+    const test = findTest(select.value, tests);
+    const draft = {
+      numeric: num(value.value),
+      comparator: cmp.value,
+      qualitative: qual.value.trim(),
+      unit: unit.value.trim(),
+      refLow: num(low.value),
+      refHigh: num(high.value),
+      date: document.getElementById("review-date").value,
+      specimen: specimenFromName(name.value),
+    };
+    const view = interpret(test, draft, profile());
+    preview.textContent = test ? `${test.name}. ${view.title}. ${view.tierLabel || view.rangeLabel}` : "Pick a catalog test, or save this row as a custom test.";
+  };
+  card.addEventListener("input", refresh);
+  card.addEventListener("change", refresh);
+  card.append(
+    el("label", { class: "field span-2" }, ["Printed name", name]),
+    el("label", { class: "field span-2" }, ["Catalog test", select]),
+    el("label", { class: "field" }, ["Compare", cmp]),
+    el("label", { class: "field" }, ["Value", value]),
+    el("label", { class: "field" }, ["Unit", unit]),
+    el("label", { class: "field" }, ["Qualitative", qual]),
+    el("label", { class: "field" }, ["Percent or IFCC", secondary]),
+    el("label", { class: "field" }, ["Ref low", low]),
+    el("label", { class: "field" }, ["Ref high", high]),
+    el("button", { type: "button", class: "btn-secondary", text: "Remove row", "data-testid": "remove-row" }),
+    preview,
+  );
+  card.querySelector("[data-testid=remove-row]").addEventListener("click", () => card.remove());
+  refresh();
   return card;
 }
 
-function field(label, type, value, testId) {
-  const input = el("input", { type, "data-testid": testId, value: value == null ? "" : String(value) });
-  return el("label", { class: "field" }, [label, input]);
-}
-
-function readOne(card) {
-  const value = card.querySelector('[data-testid="row-value"]').value;
-  return {
-    el: card,
-    testName: card.querySelector('[data-testid="row-name"]').value.trim(),
-    value,
-    unit: card.querySelector('[data-testid="row-unit"]').value.trim(),
-    refLow: card.querySelector('[data-testid="row-low"]').value,
-    refHigh: card.querySelector('[data-testid="row-high"]').value,
-    refText: card.querySelector('[data-testid="row-reftext"]').value.trim(),
-    flag: card.querySelector('[data-testid="row-flag"]').value,
-    lowInclusive: card.dataset.lowInclusive !== "false",
-    highInclusive: card.dataset.highInclusive !== "false",
-  };
-}
-
-function readReviewRows() {
-  return [...document.querySelectorAll("[data-testid=review-row]")].map(readOne);
-}
-
-function previewText(row) {
-  const value = num(row.value);
-  if (!row.testName || value == null) return "Enter a test name and a value.";
-  const assessment = assessLab({
-    testName: row.testName,
-    value,
-    unit: row.unit,
-    refLow: num(row.refLow),
-    refHigh: num(row.refHigh),
-    lowInclusive: row.lowInclusive !== false,
-    highInclusive: row.highInclusive !== false,
-    flag: row.flag,
-    refText: row.refText,
-  });
-  return `${assessment.title}. ${assessment.rangeLabel}`;
-}
-
-function renderReview(rows) {
-  const host = document.getElementById("review-rows");
-  host.replaceChildren();
-  (rows.length ? rows : [blankRow()]).forEach((row) => host.append(reviewRowElement(row)));
-}
-
-function openReview(text) {
+async function openReview(text) {
   const parsed = parseLabReport(text);
   document.getElementById("ocr-raw").textContent = text || "";
   const date = document.getElementById("review-date");
@@ -907,133 +843,146 @@ function openReview(text) {
   if (parsed.suggestedDate) date.value = parsed.suggestedDate;
   else if (!date.value) date.value = todayISO();
   if (parsed.suggestedLab) lab.value = parsed.suggestedLab;
+  const patient = document.getElementById("review-patient");
+  if (patient && !patient.value && settings.patientName) patient.value = settings.patientName;
+  const tests = testsFor(await list("customTests"));
+  const host = document.getElementById("review-rows");
+  host.replaceChildren();
+  (parsed.rows.length ? parsed.rows : [{ testName: "", value: "", unit: "" }]).forEach((row) => host.append(reviewRowElement(row, tests)));
   document.getElementById("review-empty").hidden = parsed.rows.length > 0;
-  renderReview(parsed.rows);
   const review = document.getElementById("review");
   review.hidden = false;
   review.scrollIntoView({ block: "start" });
 }
 
-async function onImage(file) {
-  if (!file) return;
-  setOcrError("");
-  showProgress("Preparing the photo…", 0.02);
-  try {
-    const text = await recognizeImage(file, (message) => {
-      showProgress(friendlyStatus(message.status), Number(message.progress) || 0);
-    });
-    hideProgress();
-    openReview(text);
-  } catch (err) {
-    hideProgress();
-    setOcrError(`${err.message || "The photo could not be read."} Nothing was saved. You can paste the text instead.`);
-  }
-}
-
 async function saveReview() {
   const date = document.getElementById("review-date").value;
-  const labName = document.getElementById("review-lab").value.trim();
-  if (!date) {
-    setOcrError("Add the report date before saving.");
-    return;
-  }
-  const saved = [];
-  for (const row of readReviewRows()) {
-    const value = num(row.value);
-    const empty = !row.testName && value == null && !row.unit;
-    if (empty) continue;
-    if (!row.testName || value == null) {
-      setOcrError("Each row needs a test name and a numeric value. Nothing new was saved.");
-      return;
+  if (!date) throw new Error("Add the date collected before saving.");
+  const tests = testsFor(await list("customTests"));
+  const fasting = document.getElementById("review-fasting").value;
+  const report = stamp({
+    id: newId(),
+    dateCollected: date,
+    patientName: document.getElementById("review-patient").value.trim() || settings.patientName || "",
+    lab: document.getElementById("review-lab").value.trim(),
+    labNumber: document.getElementById("review-number").value.trim(),
+    doctor: document.getElementById("review-doctor").value.trim(),
+    fasting: fasting === "yes" ? true : fasting === "no" ? false : null,
+    notes: "",
+    sample: false,
+  });
+  const entries = [{ store: "reports", record: report }];
+  const cards = [...document.querySelectorAll("[data-testid=review-row]")];
+  for (const card of cards) {
+    const printed = card.querySelector("[data-testid=row-name]").value.trim();
+    const numeric = num(card.querySelector("[data-testid=row-value]").value);
+    const qualitative = card.querySelector("[data-testid=row-qual]").value.trim();
+    const secondary = num(card.querySelector("[data-testid=row-secondary]").value);
+    if (!printed && numeric == null && !qualitative) continue;
+    if (numeric == null && !qualitative) throw new Error(`“${printed || "A row"}” needs a value. Nothing new was saved.`);
+    let testId = card.querySelector("[data-testid=row-test]").value;
+    let test = findTest(testId, tests);
+    if (!testId) {
+      testId = `custom-${newId()}`;
+      const custom = {
+        id: testId, name: printed || "Custom test", aliases: printed ? [printed] : [], panel: "custom", unit: card.querySelector("[data-testid=row-unit]").value.trim(), resultType: qualitative && numeric == null ? "qualitative" : "numeric", ref: null, about: "Added from a scanned report on this device.", sample: false,
+      };
+      entries.push({ store: "customTests", record: custom });
+      test = custom;
     }
-    let refLow = num(row.refLow);
-    let refHigh = num(row.refHigh);
-    let { lowInclusive, highInclusive, flag, refText } = row;
-    if (refLow == null && refHigh == null && refText) {
-      const parsed = parseRange(refText);
-      refLow = parsed.refLow;
-      refHigh = parsed.refHigh;
-      lowInclusive = parsed.lowInclusive;
-      highInclusive = parsed.highInclusive;
-      if (!flag) flag = parsed.flag;
-    }
-    saved.push(stamp({
+    const low = num(card.querySelector("[data-testid=row-low]").value);
+    const high = num(card.querySelector("[data-testid=row-high]").value);
+    entries.push({ store: "results", record: stamp({
       id: newId(),
-      testName: row.testName,
-      value,
-      unit: row.unit,
-      refLow,
-      refHigh,
-      lowInclusive,
-      highInclusive,
-      refText,
-      flag,
+      testId,
+      name: test?.name || printed,
+      reportId: report.id,
       date,
-      lab: labName,
+      numeric,
+      comparator: card.querySelector("[data-testid=row-cmp]").value,
+      qualitative,
+      unit: card.querySelector("[data-testid=row-unit]").value.trim() || test?.unit || "",
+      secondaryNumeric: secondary,
+      secondaryUnit: secondary != null ? (test?.secondary?.unit || "%") : "",
+      specimen: testId === "glucose" ? (specimenFromName(printed) || (fasting === "yes" ? "fasting" : fasting === "no" ? "random" : "")) : "",
+      refLow: low,
+      refHigh: high,
+      lowInclusive: true,
+      highInclusive: true,
+      refText: [low, high].every((item) => item == null) ? "" : `${low ?? ""} - ${high ?? ""}`.replace(" - ", low == null ? "" : " - "),
+      flag: "",
       notes: "",
       sample: false,
-    }));
+    }) });
   }
-  if (!saved.length) {
-    setOcrError("Add at least one result before saving.");
-    return;
-  }
-  for (const record of saved) await put("labs", record);
+  if (entries.length < 2) throw new Error("Add at least one result before saving.");
+  await putMany(entries);
   document.getElementById("review").hidden = true;
   document.getElementById("review-rows").replaceChildren();
-  document.getElementById("paste-text").value = "";
-  setOcrError("");
-  toast(`Saved ${saved.length} result${saved.length === 1 ? "" : "s"} on this device.`);
-  showView("home");
+  toast("Saved the reviewed report on this device.");
+  showView("panels");
+}
+
+function friendlyStatus(status) {
+  const text = String(status || "").toLowerCase();
+  if (text.includes("prepar")) return "Preparing the photo…";
+  if (text.includes("core")) return "Preparing the on-device reader…";
+  if (text.includes("language") || text.includes("trained")) return "Loading English text recognition…";
+  if (text.includes("recogn")) return "Reading the photo…";
+  return "Working…";
+}
+
+async function onImage(file) {
+  if (!file) return;
+  const error = document.getElementById("ocr-error");
+  error.hidden = true;
+  const wrap = document.getElementById("ocr-progress");
+  wrap.hidden = false;
+  try {
+    const text = await recognizeImage(file, (message) => {
+      wrap.querySelector("[data-testid=progress-label]").textContent = friendlyStatus(message.status);
+      wrap.querySelector("[data-testid=progress-bar]").style.width = `${Math.round((Number(message.progress) || 0) * 100)}%`;
+    });
+    wrap.hidden = true;
+    await openReview(text);
+  } catch (err) {
+    wrap.hidden = true;
+    error.hidden = false;
+    error.textContent = `${err.message || "The photo could not be read."} Nothing was saved.`;
+  }
 }
 
 function syncSettingsForm() {
-  document.getElementById("set-theme").value = settings.theme || "system";
+  document.getElementById("set-name").value = settings.patientName || "";
+  document.getElementById("set-theme").value = settings.theme;
   document.getElementById("set-glucose-unit").value = glucoseUnit();
   document.getElementById("set-height").value = settings.heightCm || "";
+  document.getElementById("set-sex").value = settings.sex || "";
+  document.getElementById("set-dob").value = settings.dob || "";
+  document.getElementById("set-cvrisk").value = settings.cvRisk || "";
 }
 
 async function exportJson() {
-  const data = await dump();
-  const payload = buildBackup(data, settings);
-  const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
-  const result = await saveFile(`healthlog-backup-${todayISO()}.json`, blob);
-  if (result === "downloaded") toast("Backup downloaded. On iPhone, keep it in Files from the share sheet or Downloads.");
+  const payload = buildBackup(await dump(), settings);
+  const result = await saveFile(`healthlog-backup-${todayISO()}.json`, new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" }));
+  if (result === "downloaded") toast("Backup downloaded. On iPhone, keep it in Files.");
   if (result === "shared") toast("Backup opened in the share sheet.");
-}
-
-async function exportCsv() {
-  const data = await dump();
-  const blob = new Blob([toCsv(data)], { type: "text/csv" });
-  const result = await saveFile(`healthlog-readings-${todayISO()}.csv`, blob);
-  if (result === "downloaded") toast("CSV downloaded.");
-  if (result === "shared") toast("CSV opened in the share sheet.");
 }
 
 async function importFile(file) {
   let parsed;
-  try {
-    parsed = JSON.parse(await file.text());
-  } catch {
-    await openModal({
-      title: "Could not read that file",
-      body: "Choose a HealthLog JSON backup.",
-      actions: [{ id: "modal-ok", label: "OK", value: "ok", className: "btn-primary" }],
-    });
+  try { parsed = JSON.parse(await file.text()); } catch {
+    await openModal({ title: "Could not read that file", body: "Choose a HealthLog JSON backup.", actions: [{ id: "modal-ok", label: "OK", value: "ok", className: "btn-primary" }] });
     return;
   }
   const result = validateBackup(parsed);
   if (!result.ok) {
-    await openModal({
-      title: "Backup not imported",
-      body: result.errors.join("\n"),
-      actions: [{ id: "modal-ok", label: "OK", value: "ok", className: "btn-primary" }],
-    });
+    await openModal({ title: "Backup not imported", body: result.errors.join("\n"), actions: [{ id: "modal-ok", label: "OK", value: "ok", className: "btn-primary" }] });
     return;
   }
   const choice = await openModal({
     title: "Import backup",
-    body: `This file has ${countRecords(result.counts)} records. Merge keeps what is already on this device and updates matching ids. Replace deletes everything on this device first.`,
+    body: `This file has ${countRecords(result.counts)} records. Merge keeps what is already on this device. Replace deletes everything on this device first.`,
     actions: [
       { id: "modal-merge", label: "Merge", value: "merge", className: "btn-primary" },
       { id: "modal-replace", label: "Replace", value: "replace", className: "btn-danger" },
@@ -1042,11 +991,13 @@ async function importFile(file) {
   });
   if (choice !== "merge" && choice !== "replace") return;
   await writeAll(result.data, choice);
-  if (result.settings) {
+  const rawProfile = parsed.version === 2 ? parsed.data.profile : parsed.data.settings;
+  if (rawProfile && typeof rawProfile === "object") {
     settings = { ...settings, ...result.settings };
     saveSettings();
     applyTheme();
   }
+  reportBuiltFor = null;
   toast(choice === "replace" ? "This device now matches the backup." : "Backup merged on this device.");
   showView("home");
 }
@@ -1056,7 +1007,14 @@ function bind() {
     const tab = event.target.closest("[data-tab]");
     if (tab) showView(tab.dataset.tab);
   });
-  window.addEventListener("hashchange", () => showView(location.hash.slice(1)));
+  window.addEventListener("hashchange", () => {
+    const hash = location.hash.slice(1);
+    if (hash.startsWith("test/")) {
+      openTestId = hash.slice(5);
+      showView("test");
+    } else showView(hash);
+  });
+  document.getElementById("test-back").addEventListener("click", () => showView("panels"));
   document.querySelector(".type-grid").addEventListener("click", (event) => {
     const button = event.target.closest("[data-type]");
     if (button) setAddType(button.dataset.type);
@@ -1066,21 +1024,22 @@ function bind() {
     const form = event.target;
     setFormError(form, "");
     try {
-      await saveForm(form);
+      if (form.dataset.form === "report") await saveReport(form);
+      else await saveVital(form);
     } catch (err) {
       setFormError(form, err.message || "Could not save.");
     }
   });
   document.querySelectorAll("[data-cancel-edit]").forEach((button) => {
-    button.addEventListener("click", () => resetForm(button.form));
+    button.addEventListener("click", () => resetVital(button.form));
   });
   document.getElementById("entry-list").addEventListener("click", async (event) => {
     const button = event.target.closest("[data-action]");
-    if (!button) return;
-    const rows = await list(TYPE_STORE[currentType]);
+    if (!button || !VITALS[currentType]) return;
+    const rows = await list(VITALS[currentType]);
     const row = rows.find((item) => item.id === button.dataset.id);
     if (!row) return;
-    if (button.dataset.action === "edit") startEdit(row);
+    const form = document.querySelector(`form[data-form="${currentType}"]`);
     if (button.dataset.action === "delete") {
       const choice = await openModal({
         title: "Delete this entry?",
@@ -1091,20 +1050,49 @@ function bind() {
         ],
       });
       if (choice !== "confirm") return;
-      await remove(TYPE_STORE[currentType], row.id);
-      if (formFor(currentType).dataset.editing === row.id) resetForm(formFor(currentType));
+      await remove(VITALS[currentType], row.id);
       await renderEntryList();
-      toast("Deleted from this device.");
+      return;
+    }
+    form.dataset.editing = row.id;
+    setEditing(form, true);
+    if (currentType === "bp") {
+      form.systolic.value = row.systolic;
+      form.diastolic.value = row.diastolic;
+      form.pulse.value = row.pulse ?? "";
+      form.date.value = String(row.date).length === 10 ? `${row.date}T00:00` : row.date;
+      form.notes.value = row.notes || "";
+    } else if (currentType === "weight") {
+      form.kg.value = row.kg;
+      form.heightCm.value = row.heightCm ?? "";
+      form.date.value = String(row.date).length === 10 ? `${row.date}T00:00` : row.date;
+    } else if (currentType === "glucose") {
+      form.unit.value = glucoseUnit();
+      form.unit.dataset.prev = form.unit.value;
+      form.value.value = formatGlucose(row.mmol, glucoseUnit());
+      form.context.value = row.context;
+      form.date.value = String(row.date).length === 10 ? `${row.date}T00:00` : row.date;
+    } else if (currentType === "med") {
+      form.name.value = row.name;
+      form.dose.value = row.dose || "";
+      form.frequency.value = row.frequency || "";
+      form.start.value = row.start || "";
+      form.end.value = row.end || "";
+      form.notes.value = row.notes || "";
+    } else {
+      form.date.value = String(row.date).slice(0, 10);
+      form.doctor.value = row.doctor || "";
+      form.reason.value = row.reason || "";
+      form.notes.value = row.notes || "";
+      form.followUp.value = row.followUp || "";
     }
   });
   const glucoseUnitSelect = document.querySelector('#form-glucose [name="unit"]');
   glucoseUnitSelect.addEventListener("change", () => {
     const previous = glucoseUnitSelect.dataset.prev || "mmol/L";
-    const current = glucoseUnitSelect.value;
-    const input = document.querySelector('#form-glucose [name="value"]');
-    const mmol = glucoseToMmol(input.value, previous);
-    if (mmol != null) input.value = formatGlucose(mmol, current);
-    glucoseUnitSelect.dataset.prev = current;
+    const mmol = glucoseToMmol(document.querySelector('#form-glucose [name="value"]').value, previous);
+    if (mmol != null) document.querySelector('#form-glucose [name="value"]').value = formatGlucose(mmol, glucoseUnitSelect.value);
+    glucoseUnitSelect.dataset.prev = glucoseUnitSelect.value;
   });
   document.getElementById("scan-file").addEventListener("change", (event) => {
     const file = event.target.files && event.target.files[0];
@@ -1119,56 +1107,59 @@ function bind() {
   document.getElementById("show-paste").addEventListener("click", () => {
     document.getElementById("paste-wrap").hidden = false;
     document.getElementById("parse-paste").hidden = false;
-    document.getElementById("paste-text").focus();
   });
   document.getElementById("parse-paste").addEventListener("click", () => {
     const text = document.getElementById("paste-text").value;
     if (!text.trim()) {
-      setOcrError("Paste the report text first. Nothing was saved.");
+      document.getElementById("ocr-error").hidden = false;
+      document.getElementById("ocr-error").textContent = "Paste the report text first. Nothing was saved.";
       return;
     }
-    setOcrError("");
     openReview(text);
   });
-  document.getElementById("add-row").addEventListener("click", () => {
-    renderReview(readReviewRows().concat(blankRow()));
+  document.getElementById("add-row").addEventListener("click", async () => {
+    const tests = testsFor(await list("customTests"));
+    document.getElementById("review-rows").append(reviewRowElement({ testName: "", value: "", unit: "" }, tests));
   });
   document.getElementById("save-review").addEventListener("click", () => {
-    saveReview().catch((err) => setOcrError(err.message || "Could not save."));
+    saveReview().catch((err) => {
+      const node = document.getElementById("ocr-error");
+      node.hidden = false;
+      node.textContent = err.message || "Could not save.";
+    });
   });
-  document.querySelector(".segment").addEventListener("click", (event) => {
-    const button = event.target.closest("[data-range]");
-    if (!button) return;
-    trendRange = button.dataset.range;
-    renderTrends();
-  });
-  document.getElementById("set-theme").addEventListener("change", (event) => {
-    settings.theme = event.target.value;
+  document.getElementById("set-name").addEventListener("change", (event) => {
+    settings.patientName = event.target.value.trim();
     saveSettings();
-    applyTheme();
-    if (!document.getElementById("view-trends").hidden) renderTrends();
+    showPatientName();
   });
-  document.getElementById("set-glucose-unit").addEventListener("change", (event) => {
-    settings.glucoseUnit = event.target.value;
+  ["set-theme", "set-glucose-unit", "set-sex", "set-cvrisk"].forEach((id) => {
+    document.getElementById(id).addEventListener("change", (event) => {
+      const key = { "set-theme": "theme", "set-glucose-unit": "glucoseUnit", "set-sex": "sex", "set-cvrisk": "cvRisk" }[id];
+      settings[key] = event.target.value;
+      saveSettings();
+      if (key === "theme") applyTheme();
+      toast("Saved on this device.");
+    });
+  });
+  document.getElementById("set-dob").addEventListener("change", (event) => {
+    settings.dob = event.target.value;
     saveSettings();
-    toast(`Blood sugar will show in ${settings.glucoseUnit}.`);
   });
   document.getElementById("set-height").addEventListener("change", (event) => {
     const value = num(event.target.value);
     if (event.target.value && (value == null || value < 50 || value > 260)) {
-      toast("Enter height in centimetres, for example 165.");
+      toast("Enter height in centimetres.");
       event.target.value = settings.heightCm || "";
       return;
     }
     settings.heightCm = value || "";
     saveSettings();
-    toast("Height saved on this device.");
   });
-  document.getElementById("export-json").addEventListener("click", () => {
-    exportJson().catch(() => toast("Could not export the backup."));
-  });
-  document.getElementById("export-csv").addEventListener("click", () => {
-    exportCsv().catch(() => toast("Could not export the CSV."));
+  document.getElementById("export-json").addEventListener("click", () => exportJson().catch(() => toast("Could not export.")));
+  document.getElementById("export-csv").addEventListener("click", async () => {
+    const result = await saveFile(`healthlog-readings-${todayISO()}.csv`, new Blob([toCsv(await dump())], { type: "text/csv" }));
+    if (result !== "cancelled") toast("CSV ready.");
   });
   document.getElementById("import-file").addEventListener("change", (event) => {
     const file = event.target.files && event.target.files[0];
@@ -1178,7 +1169,7 @@ function bind() {
   document.getElementById("load-sample").addEventListener("click", async () => {
     const choice = await openModal({
       title: "Load fictional sample data?",
-      body: "This adds labelled SAMPLE rows on this device so you can try charts and flags. It is not real health data. Existing sample rows are replaced.",
+      body: "This adds a labelled SAMPLE screening panel so you can try the layout. It is not a real person. Existing sample rows are replaced.",
       actions: [
         { id: "modal-cancel", label: "Cancel", value: "cancel", className: "btn-secondary" },
         { id: "modal-confirm", label: "Load sample data", value: "confirm", className: "btn-primary" },
@@ -1188,7 +1179,7 @@ function bind() {
     await removeSample();
     await writeAll(buildSample(), "merge");
     toast("Fictional sample data was added on this device.");
-    showView("home");
+    showView("panels");
   });
   document.getElementById("clear-sample").addEventListener("click", async () => {
     await removeSample();
@@ -1200,7 +1191,7 @@ function bind() {
     const count = Object.values(data).reduce((sum, rows) => sum + rows.length, 0);
     const choice = await openModal({
       title: "Delete all health data?",
-      body: `This removes ${count} records from this device. Theme and unit settings stay. Export a backup first if you might want them back. This cannot be undone.`,
+      body: `This removes ${count} records from this device. Theme and profile settings stay. Export a backup first if you might want them back.`,
       actions: [
         { id: "modal-cancel", label: "Cancel", value: "cancel", className: "btn-secondary" },
         { id: "modal-confirm", label: "Delete all data", value: "confirm", className: "btn-danger" },
@@ -1216,16 +1207,23 @@ function bind() {
   });
 }
 
+function startEditFromList() { /* edit is handled in the entry-list click listener */ }
+
 async function init() {
   applyTheme();
   bind();
-  document.querySelectorAll("form[data-form]").forEach(resetForm);
-  setAddType("lab");
-  const initial = location.hash.slice(1);
-  showView(VIEWS.includes(initial) ? initial : "home");
-  if ("serviceWorker" in navigator) {
-    navigator.serviceWorker.register("./sw.js").catch(() => {});
-  }
+  document.querySelectorAll('#view-add form[data-form="bp"], #view-add form[data-form="weight"], #view-add form[data-form="glucose"], #view-add form[data-form="med"], #view-add form[data-form="visit"]').forEach(resetVital);
+  setAddType("report");
+  const hash = location.hash.slice(1);
+  if (hash.startsWith("test/")) {
+    openTestId = hash.slice(5);
+    showView("test");
+  } else showView(VIEWS.includes(hash) ? hash : "home");
+  if ("serviceWorker" in navigator) navigator.serviceWorker.register("./sw.js").catch(() => {});
 }
 
 init();
+void startEditFromList;
+void parseRange;
+void panelLabel;
+void CATALOG;

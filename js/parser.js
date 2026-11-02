@@ -1,11 +1,13 @@
 import { canonicalUnit } from "./format.js";
 
 const UNIT_SRC = [
-  "x\\s?10\\^[69]/l",
-  "x\\s?10[69]/l",
-  "10\\^[69]/l",
-  "10\\*[69]/l",
+  "x\\s?10\\^(?:12|9|6)/l",
+  "x\\s?10(?:12|9|6)/l",
+  "10\\^(?:12|9|6)/l",
+  "10\\*(?:12|9|6)/l",
+  "mmol/mol",
   "mmol/l",
+  "au/ml",
   "mg/dl",
   "g/dl",
   "umol/l",
@@ -20,15 +22,18 @@ const UNIT_SRC = [
   "pg/ml",
   "mm/hr?",
   "ml/min(?:/1\\.73m2)?",
+  "l/l",
   "g/l",
   "u/l",
   "iu/l",
+  "index",
+  "ratio",
   "fl",
   "%",
 ].join("|");
 
 const LINE_RE = new RegExp(
-  `^(.+?)\\s+(-?\\d+(?:\\.\\d+)?)\\s*(${UNIT_SRC})(?![a-z0-9])(.*)$`,
+  `^(.+?)\\s+([<>]=?)?\\s*(-?\\d+(?:\\.\\d+)?)\\s*(${UNIT_SRC})(?![a-z0-9])(.*)$`,
   "i",
 );
 
@@ -189,6 +194,7 @@ function acceptableName(name) {
   if (!/[A-Za-z]/.test(name)) return false;
   const key = name.toLowerCase().replace(/[^a-z]+/g, " ").trim();
   if (STOP_NAMES.has(key)) return false;
+  if (/\b(patient|collected|reported|doctor|page|printed|laboratory|nric)\b/.test(key)) return false;
   if (/^\d/.test(name) && !/^(25|b12|hb)/i.test(name)) return false;
   return true;
 }
@@ -198,14 +204,53 @@ function parseLineOnce(line) {
   if (!match) return null;
   const name = correctTestName(match[1].replace(/[:|]+$/g, "").trim());
   if (!acceptableName(name)) return null;
-  const value = cleanNumber(match[2]);
+  const comparator = match[2] || "";
+  const value = cleanNumber(match[3]);
   if (value == null || Math.abs(value) > 100000) return null;
-  const unit = canonicalUnit(match[3]);
+  const unit = canonicalUnit(match[4]);
+  let rest = match[5] || "";
+  let secondary = null;
+  if (unit !== "%") {
+    const pct = rest.match(/(\d+(?:\.\d+)?)\s*%/);
+    if (pct) {
+      secondary = cleanNumber(pct[1]);
+      rest = rest.replace(pct[0], " ");
+    }
+  }
+  const range = parseRange(rest);
+  return {
+    testName: name,
+    value,
+    comparator,
+    unit,
+    secondary,
+    refLow: range.refLow,
+    refHigh: range.refHigh,
+    lowInclusive: range.lowInclusive,
+    highInclusive: range.highInclusive,
+    refText: range.refText,
+    flag: range.flag,
+  };
+}
+
+const LOOSE_RE = /^(.+?)\s+([<>]=?)?\s*(-?\d+(?:\.\d+)?)(?:\s+(.*))?$/;
+
+function parseLooseOnce(line) {
+  if (parseLineOnce(line)) return null;
+  const match = line.match(LOOSE_RE);
+  if (!match) return null;
+  const name = correctTestName(match[1].replace(/[:|]+$/g, "").trim());
+  if (!acceptableName(name)) return null;
+  if (/^\d/.test(name)) return null;
+  const value = cleanNumber(match[3]);
+  if (value == null || Math.abs(value) > 100000) return null;
   const range = parseRange(match[4] || "");
   return {
     testName: name,
     value,
-    unit,
+    comparator: match[2] || "",
+    unit: "",
+    secondary: null,
     refLow: range.refLow,
     refHigh: range.refHigh,
     lowInclusive: range.lowInclusive,
@@ -218,7 +263,7 @@ function parseLineOnce(line) {
 export function parseLine(line) {
   const cleaned = normalizeLine(line);
   const repaired = cleaned.replace(/(\d)[Oo](\d)/g, (_m, a, b) => `${a}0${b}`);
-  return parseLineOnce(cleaned) || parseLineOnce(repaired);
+  return parseLineOnce(cleaned) || parseLineOnce(repaired) || parseLooseOnce(cleaned) || parseLooseOnce(repaired);
 }
 
 function looksLikeNameOnly(line) {

@@ -1,51 +1,110 @@
-import { newId } from "./db.js";
+import { newId } from "./id.js";
 import { addDays } from "./format.js";
 
-function lab(partial) {
+function result(partial) {
   return {
     id: newId(),
-    testName: partial.testName,
-    value: partial.value,
-    unit: partial.unit,
+    testId: partial.testId,
+    name: `${partial.name} (SAMPLE)`,
+    reportId: partial.reportId,
+    date: partial.date,
+    numeric: partial.numeric ?? null,
+    comparator: partial.comparator || "",
+    qualitative: partial.qualitative || "",
+    unit: partial.unit || "",
+    secondaryNumeric: partial.secondaryNumeric ?? null,
+    secondaryUnit: partial.secondaryUnit || "",
+    specimen: partial.specimen || "",
     refLow: partial.refLow ?? null,
     refHigh: partial.refHigh ?? null,
     lowInclusive: partial.lowInclusive !== false,
     highInclusive: partial.highInclusive !== false,
     refText: partial.refText || "",
     flag: partial.flag || "",
-    date: partial.date,
-    lab: "Fictional Sample Lab",
-    notes: "Fictional demo data — not a real person.",
+    notes: "Fictional demo — not a real person.",
     sample: true,
   };
 }
 
 export function buildSample(now = new Date()) {
   const day = (n) => addDays(n, now);
+  const reportId = newId();
+  const olderId = newId();
+  const date = day(-18);
+  const older = day(-200);
+  const followDate = day(40);
   return {
-    labs: [
-      lab({ testName: "Haemoglobin (SAMPLE)", value: 136, unit: "g/L", refLow: 120, refHigh: 170, refText: "120 - 170", date: day(-200) }),
-      lab({ testName: "Haemoglobin (SAMPLE)", value: 140, unit: "g/L", refLow: 120, refHigh: 170, refText: "120 - 170", date: day(-20) }),
-      lab({ testName: "LDL cholesterol (SAMPLE)", value: 3.1, unit: "mmol/L", refHigh: 3.4, highInclusive: false, refText: "< 3.4", date: day(-200) }),
-      lab({ testName: "LDL cholesterol (SAMPLE)", value: 3.6, unit: "mmol/L", refHigh: 3.4, highInclusive: false, refText: "< 3.4", flag: "H", date: day(-40) }),
-      lab({ testName: "LDL cholesterol (SAMPLE)", value: 3.9, unit: "mmol/L", refHigh: 3.4, highInclusive: false, refText: "< 3.4", flag: "H", date: day(-18) }),
-      lab({ testName: "HbA1c (SAMPLE)", value: 5.2, unit: "%", refHigh: 5.7, highInclusive: false, refText: "< 5.7", date: day(-200) }),
-      lab({ testName: "HbA1c (SAMPLE)", value: 5.4, unit: "%", refHigh: 5.7, highInclusive: false, refText: "< 5.7", date: day(-18) }),
+    reports: [
+      {
+        id: olderId,
+        dateCollected: older,
+        patientName: "Demo Person (SAMPLE)",
+        lab: "Fictional Sample Lab",
+        labNumber: "GS-SAMPLE-000",
+        doctor: "Dr Example (fictional)",
+        fasting: true,
+        notes: "Earlier fictional screening. Not a real report.",
+        sample: true,
+      },
+      {
+        id: reportId,
+        dateCollected: date,
+        patientName: "Demo Person (SAMPLE)",
+        lab: "Fictional Sample Lab",
+        labNumber: "GS-SAMPLE-001",
+        doctor: "Dr Example (fictional)",
+        fasting: true,
+        notes: "Fictional GS15M-style panel. Not a real person.",
+        sample: true,
+      },
     ],
+    results: [
+      result({ testId: "hb", name: "Haemoglobin", reportId: olderId, date: older, numeric: 136, unit: "g/L", refLow: 130, refHigh: 170, refText: "130 - 170" }),
+      result({ testId: "hb", name: "Haemoglobin", reportId, date, numeric: 142, unit: "g/L", refLow: 130, refHigh: 170, refText: "130 - 170" }),
+      result({ testId: "wbc", name: "White cell count", reportId, date, numeric: 6.4, unit: "x10^9/L", refLow: 4, refHigh: 10, refText: "4.0 - 10.0" }),
+      result({ testId: "neut", name: "Neutrophils", reportId, date, numeric: 3.5, unit: "x10^9/L", secondaryNumeric: 55, secondaryUnit: "%", refLow: 2, refHigh: 7 }),
+      result({ testId: "plt", name: "Platelets", reportId, date, numeric: 240, unit: "x10^9/L", refLow: 150, refHigh: 410 }),
+      result({ testId: "tc", name: "Total cholesterol", reportId, date, numeric: 5.4, unit: "mmol/L", refHigh: 5.2, highInclusive: false, refText: "<5.2" }),
+      result({ testId: "hdl", name: "HDL-C", reportId, date, numeric: 1.2, unit: "mmol/L", refLow: 1, lowInclusive: false, refText: ">1.00" }),
+      result({ testId: "ldl", name: "LDL-C", reportId, date, numeric: 3.1, unit: "mmol/L", refHigh: 2.6, highInclusive: false, refText: "<2.60" }),
+      result({ testId: "ldl", name: "LDL-C", reportId: olderId, date: older, numeric: 2.8, unit: "mmol/L", refHigh: 2.6, highInclusive: false, refText: "<2.60" }),
+      result({ testId: "glucose", name: "Glucose", reportId, date, numeric: 5.2, unit: "mmol/L", specimen: "fasting", refLow: 3.9, refHigh: 6, refText: "3.9 - 6.0" }),
+      result({ testId: "hba1c", name: "HbA1c", reportId, date, numeric: 5.4, unit: "%", secondaryNumeric: 36, secondaryUnit: "mmol/mol", refHigh: 5.7, highInclusive: false, refText: "<5.7" }),
+      result({ testId: "alt", name: "ALT", reportId, date, numeric: 28, unit: "U/L", refHigh: 51, highInclusive: false, refText: "<51" }),
+      result({ testId: "egfr", name: "eGFR", reportId, date, numeric: 96, unit: "mL/min/1.73m2" }),
+      result({ testId: "tsh", name: "TSH", reportId, date, numeric: 1.8, unit: "mIU/L", refLow: 0.4, refHigh: 4.7 }),
+      result({ testId: "hbsag", name: "Hep B surface antigen", reportId, date, qualitative: "Not detected" }),
+      result({ testId: "hbsab", name: "Hep B surface antibody", reportId, date, numeric: 86, unit: "IU/L" }),
+      result({ testId: "hepa-igg", name: "Hep A IgG", reportId, date, qualitative: "Detected" }),
+      result({ testId: "hpylori", name: "H. pylori IgG", reportId, date, numeric: 1.2, unit: "index" }),
+      result({ testId: "urine-transparency", name: "Urine transparency", reportId, date, qualitative: "Clear" }),
+      result({ testId: "urine-colour", name: "Urine colour", reportId, date, qualitative: "Pale yellow" }),
+      result({ testId: "urine-protein", name: "Urine protein", reportId, date, qualitative: "Negative" }),
+      result({ testId: "rf", name: "Rheumatoid factor", reportId, date, numeric: 20, comparator: "<", unit: "IU/mL", refHigh: 20, highInclusive: false, refText: "<20" }),
+    ],
+    followups: [
+      {
+        id: newId(),
+        testId: "hpylori",
+        resultId: "",
+        reportId,
+        action: "Fictional: ask about a urea breath test",
+        date: followDate,
+        notes: "Not a real appointment.",
+        done: false,
+        sample: true,
+      },
+    ],
+    customTests: [],
     bp: [
-      { id: newId(), systolic: 116, diastolic: 74, pulse: 68, date: `${day(-70)}T08:10`, notes: "Fictional demo reading.", sample: true },
-      { id: newId(), systolic: 122, diastolic: 78, pulse: 70, date: `${day(-28)}T08:05`, notes: "Fictional demo reading.", sample: true },
+      { id: newId(), systolic: 118, diastolic: 76, pulse: 68, date: `${day(-40)}T08:00`, notes: "Fictional demo reading.", sample: true },
       { id: newId(), systolic: 128, diastolic: 82, pulse: 72, date: `${day(-2)}T08:00`, notes: "Fictional demo reading.", sample: true },
     ],
     weights: [
-      { id: newId(), kg: 66.4, heightCm: 165, date: `${day(-80)}T07:40`, notes: "Fictional demo weight.", sample: true },
-      { id: newId(), kg: 65.5, heightCm: 165, date: `${day(-30)}T07:40`, notes: "Fictional demo weight.", sample: true },
-      { id: newId(), kg: 64.8, heightCm: 165, date: `${day(-3)}T07:45`, notes: "Fictional demo weight.", sample: true },
+      { id: newId(), kg: 70, heightCm: 170, date: `${day(-2)}T07:40`, notes: "Fictional demo weight.", sample: true },
     ],
     glucose: [
-      { id: newId(), mmol: 5.1, context: "fasting", date: `${day(-21)}T07:30`, notes: "Fictional demo glucose.", sample: true },
-      { id: newId(), mmol: 5.3, context: "fasting", date: `${day(-10)}T07:30`, notes: "Fictional demo glucose.", sample: true },
-      { id: newId(), mmol: 5.4, context: "fasting", date: `${day(-1)}T07:25`, notes: "Fictional demo glucose.", sample: true },
+      { id: newId(), mmol: 5.3, context: "fasting", date: `${day(-1)}T07:20`, notes: "Fictional home glucose.", sample: true },
     ],
     meds: [
       {
@@ -55,7 +114,7 @@ export function buildSample(now = new Date()) {
         frequency: "Once daily",
         start: day(-100),
         end: "",
-        notes: "Fictional demo medication. Not a prescription.",
+        notes: "Fictional demo. Not a prescription.",
         sample: true,
       },
     ],
@@ -64,9 +123,9 @@ export function buildSample(now = new Date()) {
         id: newId(),
         date: day(-18),
         doctor: "Dr Example (fictional)",
-        reason: "Demo check-up",
-        notes: "Fake visit for trying HealthLog. Not a real appointment.",
-        followUp: day(21),
+        reason: "Demo screening review",
+        notes: "Fake visit. Not a real appointment.",
+        followUp: followDate,
         sample: true,
       },
     ],

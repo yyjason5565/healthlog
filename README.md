@@ -6,14 +6,11 @@ GitHub Pages can serve it from the repository root at `https://yyjason5565.githu
 
 ## What you can record
 
-- Lab results: test name, value, unit, reference range, date, and lab or clinic
-- Blood pressure: systolic, diastolic, and optional pulse
-- Weight in kilograms, with optional height so BMI can be shown
-- Blood sugar in mmol/L by default, or mg/dL (stored as mmol/L and converted)
-- Medications: name, dose, frequency, start, end, and notes
-- Doctor visits: date, doctor or clinic, reason, notes, and a follow-up date
+Screening results follow a built-in catalog based on the printed names, units, and generic reference ranges of an Innoquest Pathology general screening panel (GS15M). Panels group the tests. Each test can be numeric, qualitative, or both, including censored values such as `<20`. A range saved on a result overrides the catalog default. You can add your own tests.
 
-Every entry can be edited or deleted.
+The profile stores a patient name, sex, and date of birth on this device only. Each report also stores a patient name, collection date, lab, lab number, doctor or clinic, and whether the sample was fasting. The profile name is shown in the header. The report name is shown on the checklist and on a test’s history.
+
+Blood pressure, weight and BMI, home blood sugar, medications, and doctor visits are still there. Every entry can be edited or deleted. Flagged tests can have a follow-up note and date, which show on Home.
 
 ## Scanning a report
 
@@ -35,13 +32,93 @@ Trends plot blood pressure (both lines), weight, blood sugar, and any lab test w
 
 Charts are drawn with Chart.js from `vendor/chart.umd.min.js`. No chart library is loaded from a CDN.
 
-## Backup
+## Backup version 2
+
+Export writes version 2 JSON. Import still accepts version 1. Version 1 `labs` rows are matched to catalog tests by name and alias, and rows that share a collection date and lab name become one report. A version 1 name that does not match is kept as a custom test.
+
+`profile.patientName` is the name in the header. `reports[].patientName` is the name stored with that report. `profile.cvRisk` is `""`, `"low"`, `"moderate"`, `"high"`, `"veryhigh"`, or `"recurrent"`. `profile.sex` is `""`, `"female"`, or `"male"`. `results[].comparator` is `""`, `"<"`, `"<="`, `">"`, or `">="`. `results[].specimen` is `""`, `"fasting"`, or `"random"`. `reports[].fasting` is `true`, `false`, or `null`.
+
+```json
+{
+  "app": "HealthLog",
+  "version": 2,
+  "exportedAt": "2026-03-13T00:00:00.000Z",
+  "data": {
+    "profile": {
+      "patientName": "Demo Person",
+      "sex": "male",
+      "dob": "1980-01-01",
+      "cvRisk": "",
+      "theme": "system",
+      "glucoseUnit": "mmol/L",
+      "heightCm": 170,
+      "hintDismissed": false
+    },
+    "reports": [
+      {
+        "id": "rpt-sample-1",
+        "dateCollected": "2026-03-13",
+        "patientName": "Demo Person",
+        "lab": "Fictional Sample Lab",
+        "labNumber": "GS-SAMPLE-001",
+        "doctor": "Dr Example (fictional)",
+        "fasting": true,
+        "notes": "Fictional demo. Not a real person.",
+        "sample": true
+      }
+    ],
+    "results": [
+      {
+        "id": "res-sample-hb",
+        "testId": "hb",
+        "name": "Haemoglobin",
+        "reportId": "rpt-sample-1",
+        "date": "2026-03-13",
+        "numeric": 140,
+        "comparator": "",
+        "qualitative": "",
+        "unit": "g/L",
+        "secondaryNumeric": null,
+        "secondaryUnit": "",
+        "specimen": "",
+        "refLow": 130,
+        "refHigh": 170,
+        "lowInclusive": true,
+        "highInclusive": true,
+        "refText": "130 - 170",
+        "flag": "",
+        "notes": "Fictional demo. Not a real person.",
+        "sample": true
+      }
+    ],
+    "followups": [
+      {
+        "id": "fu-sample-1",
+        "testId": "hpylori",
+        "resultId": "",
+        "reportId": "rpt-sample-1",
+        "action": "Fictional: ask about a urea breath test",
+        "date": "2026-06-01",
+        "notes": "Not a real appointment.",
+        "done": false,
+        "sample": true
+      }
+    ],
+    "customTests": [],
+    "bp": [],
+    "weights": [],
+    "glucose": [],
+    "meds": [],
+    "visits": []
+  }
+}
+```
 
 - **Export JSON backup** uses the share sheet when the phone allows it, otherwise a download, so the file can be kept in Files.
-- **Import backup** checks that the file is a HealthLog backup, then asks you to merge or replace.
+- **Import backup** checks the file, then asks you to merge or replace.
 - **Export CSV** writes a spreadsheet of the readings.
-- **Delete all data** asks first. Theme and unit settings stay; the health records do not.
-- **Load sample data** adds fictional rows marked SAMPLE. Nothing fictional is loaded on its own. **Remove sample data** deletes only those rows.
+- **Delete all data** asks first. Theme and profile settings stay; the health records do not.
+- **Load sample data** adds fictional rows marked SAMPLE, including the name “Demo Person (SAMPLE)”. Nothing fictional is loaded on its own. **Remove sample data** deletes only those rows.
 
 ## Privacy
 

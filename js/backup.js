@@ -1,4 +1,6 @@
 import { STORES } from "./db.js";
+import { newId } from "./id.js";
+import { matchTest, reportGroupKey, specimenFromName } from "./match.js";
 
 const DATE_RE = /^\d{4}-\d{2}-\d{2}(T\d{2}:\d{2})?$/;
 
@@ -168,7 +170,10 @@ function sanitizeVisit(record, index, errors) {
 }
 
 const SANITIZERS = {
-  labs: sanitizeLab,
+  reports: sanitizeReport,
+  results: sanitizeResult,
+  followups: sanitizeFollow,
+  customTests: sanitizeCustom,
   bp: sanitizeBp,
   weights: sanitizeWeight,
   glucose: sanitizeGlucose,
@@ -176,29 +181,210 @@ const SANITIZERS = {
   visits: sanitizeVisit,
 };
 
-export function sanitizeSettings(input) {
-  if (!isObject(input)) return null;
-  const height = input.heightCm === "" || input.heightCm == null ? "" : Number(input.heightCm);
+function sanitizeResult(record, index, errors) {
+  const label = `Result ${index + 1}`;
+  if (!isObject(record)) {
+    push(errors, `${label} is not an object.`);
+    return null;
+  }
+  const comparator = ["", "<", "<=", ">", ">="].includes(record.comparator) ? record.comparator : "";
+  const specimen = ["", "fasting", "random"].includes(record.specimen) ? record.specimen : "";
   return {
-    theme: ["system", "light", "dark"].includes(input.theme) ? input.theme : "system",
-    glucoseUnit: input.glucoseUnit === "mg/dL" ? "mg/dL" : "mmol/L",
-    heightCm: Number.isFinite(height) ? height : "",
-    hintDismissed: input.hintDismissed === true,
+    ...base(record, errors, label),
+    testId: text(record.testId, 80, errors, `${label} test`, true),
+    name: text(record.name, 120, errors, `${label} name`, false),
+    reportId: text(record.reportId, 80, errors, `${label} report`, false),
+    date: dateField(record.date, errors, `${label} date`, true),
+    numeric: optionalNumber(record.numeric, errors, `${label} value`),
+    comparator,
+    qualitative: text(record.qualitative, 80, errors, `${label} qualitative`, false),
+    unit: text(record.unit, 32, errors, `${label} unit`, false),
+    secondaryNumeric: optionalNumber(record.secondaryNumeric, errors, `${label} secondary`),
+    secondaryUnit: text(record.secondaryUnit, 32, errors, `${label} secondary unit`, false),
+    specimen,
+    refLow: optionalNumber(record.refLow, errors, `${label} reference low`),
+    refHigh: optionalNumber(record.refHigh, errors, `${label} reference high`),
+    lowInclusive: record.lowInclusive !== false,
+    highInclusive: record.highInclusive !== false,
+    refText: text(record.refText, 80, errors, `${label} reference text`, false),
+    flag: flagField(record.flag),
   };
+}
+
+function requireResultValue(row, index, errors) {
+  if (row && row.numeric == null && !row.qualitative) {
+    push(errors, `Result ${index + 1} needs a value.`);
+  }
+  return row;
+}
+
+function sanitizeReport(record, index, errors) {
+  const label = `Report ${index + 1}`;
+  if (!isObject(record)) {
+    push(errors, `${label} is not an object.`);
+    return null;
+  }
+  let fasting = null;
+  if (record.fasting === true || record.fasting === false) fasting = record.fasting;
+  return {
+    ...base(record, errors, label),
+    dateCollected: dateField(record.dateCollected, errors, `${label} date`, true),
+    patientName: text(record.patientName, 120, errors, `${label} patient`, false),
+    lab: text(record.lab, 120, errors, `${label} lab`, false),
+    labNumber: text(record.labNumber, 80, errors, `${label} number`, false),
+    doctor: text(record.doctor, 120, errors, `${label} doctor`, false),
+    fasting,
+  };
+}
+
+function sanitizeFollow(record, index, errors) {
+  const label = `Follow-up ${index + 1}`;
+  if (!isObject(record)) {
+    push(errors, `${label} is not an object.`);
+    return null;
+  }
+  return {
+    ...base(record, errors, label),
+    testId: text(record.testId, 80, errors, `${label} test`, false),
+    resultId: text(record.resultId, 80, errors, `${label} result`, false),
+    reportId: text(record.reportId, 80, errors, `${label} report`, false),
+    action: text(record.action, 200, errors, `${label} action`, true),
+    date: dateField(record.date, errors, `${label} date`, true),
+    done: record.done === true,
+  };
+}
+
+function sanitizeCustom(record, index, errors) {
+  const label = `Custom test ${index + 1}`;
+  if (!isObject(record)) {
+    push(errors, `${label} is not an object.`);
+    return null;
+  }
+  const type = ["numeric", "qualitative", "text", "both"].includes(record.resultType) ? record.resultType : "numeric";
+  return {
+    id: freshId(record.id),
+    name: text(record.name, 120, errors, `${label} name`, true),
+    aliases: Array.isArray(record.aliases) ? record.aliases.map((item) => String(item).slice(0, 80)).slice(0, 20) : [],
+    panel: text(record.panel, 40, errors, `${label} panel`, false) || "custom",
+    unit: text(record.unit, 32, errors, `${label} unit`, false),
+    resultType: type,
+    ref: isObject(record.ref) ? {
+      low: record.ref.low ?? null,
+      high: record.ref.high ?? null,
+      lowInclusive: record.ref.lowInclusive !== false,
+      highInclusive: record.ref.highInclusive !== false,
+      text: text(record.ref.text, 80, errors, `${label} range`, false),
+    } : null,
+    about: text(record.about, 400, errors, `${label} note`, false),
+    sample: record.sample === true,
+  };
+}
+
+function convertV1(data) {
+  const labs = Array.isArray(data.labs) ? data.labs : [];
+  const reports = [];
+  const results = [];
+  const customTests = [];
+  const groups = new Map();
+  labs.forEach((lab) => {
+    const key = reportGroupKey(lab.date, lab.lab);
+    if (!groups.has(key)) {
+      const report = {
+        id: newId(),
+        dateCollected: String(lab.date || "").slice(0, 10),
+        patientName: "",
+        lab: String(lab.lab || "").trim(),
+        labNumber: "",
+        doctor: "",
+        fasting: null,
+        notes: "",
+        sample: lab.sample === true,
+      };
+      groups.set(key, report);
+      reports.push(report);
+    }
+    const report = groups.get(key);
+    const matched = matchTest(lab.testName);
+    let testId = matched?.id || "";
+    if (!testId) {
+      testId = `custom-${lab.id || newId()}`;
+      customTests.push({
+        id: testId,
+        name: lab.testName || "Custom test",
+        aliases: [lab.testName || ""],
+        panel: "custom",
+        unit: lab.unit || "",
+        resultType: "numeric",
+        ref: null,
+        about: "Imported from a version 1 backup.",
+        sample: lab.sample === true,
+      });
+    }
+    results.push({
+      id: lab.id || newId(),
+      testId,
+      name: lab.testName || "",
+      reportId: report.id,
+      date: String(lab.date || "").slice(0, 10),
+      numeric: lab.value,
+      comparator: "",
+      qualitative: "",
+      unit: lab.unit || "",
+      secondaryNumeric: null,
+      secondaryUnit: "",
+      specimen: specimenFromName(lab.testName),
+      refLow: lab.refLow ?? null,
+      refHigh: lab.refHigh ?? null,
+      lowInclusive: lab.lowInclusive !== false,
+      highInclusive: lab.highInclusive !== false,
+      refText: lab.refText || "",
+      flag: lab.flag || "",
+      notes: lab.notes || "",
+      sample: lab.sample === true,
+    });
+  });
+  return {
+    ...data,
+    reports,
+    results,
+    followups: [],
+    customTests,
+    profile: data.settings || null,
+  };
+}
+
+export function profileFrom(input) {
+  const source = isObject(input) ? input : {};
+  const height = source.heightCm === "" || source.heightCm == null ? "" : Number(source.heightCm);
+  return {
+    theme: ["system", "light", "dark"].includes(source.theme) ? source.theme : "system",
+    glucoseUnit: source.glucoseUnit === "mg/dL" ? "mg/dL" : "mmol/L",
+    heightCm: Number.isFinite(height) ? height : "",
+    hintDismissed: source.hintDismissed === true,
+    patientName: text(source.patientName, 120, [], "Patient name", false),
+    sex: ["", "female", "male"].includes(source.sex) ? source.sex : "",
+    dob: typeof source.dob === "string" && /^\d{4}-\d{2}-\d{2}$/.test(source.dob) ? source.dob : "",
+    cvRisk: ["", "low", "moderate", "high", "veryhigh", "recurrent"].includes(source.cvRisk) ? source.cvRisk : "",
+  };
+}
+
+export function sanitizeSettings(input) {
+  return profileFrom(input);
 }
 
 export function validateBackup(obj) {
   const errors = [];
   if (!isObject(obj)) return { ok: false, errors: ["That file is not a HealthLog backup."] };
   if (obj.app !== "HealthLog") errors.push("This file is not a HealthLog backup.");
-  if (obj.version !== 1) errors.push("This backup version is not supported.");
+  if (obj.version !== 1 && obj.version !== 2) errors.push("This backup version is not supported.");
   if (!isObject(obj.data)) errors.push("The backup has no data.");
   if (errors.length) return { ok: false, errors };
 
+  const source = obj.version === 1 ? convertV1(obj.data) : obj.data;
   const data = {};
   const counts = {};
   STORES.forEach((store) => {
-    const rows = obj.data[store];
+    const rows = source[store];
     if (rows == null) {
       data[store] = [];
       counts[store] = 0;
@@ -210,31 +396,34 @@ export function validateBackup(obj) {
       counts[store] = 0;
       return;
     }
-    data[store] = rows.map((row, index) => SANITIZERS[store](row, index, errors)).filter(Boolean);
+    data[store] = rows.map((row, index) => {
+      const clean = SANITIZERS[store](row, index, errors);
+      return store === "results" ? requireResultValue(clean, index, errors) : clean;
+    }).filter(Boolean);
     counts[store] = data[store].length;
   });
   if (errors.length) return { ok: false, errors: errors.slice(0, 8) };
-  return {
-    ok: true,
-    data,
-    counts,
-    settings: sanitizeSettings(obj.data.settings),
-  };
+  const profile = profileFrom(source.profile || source.settings || obj.data.settings);
+  return { ok: true, data, counts, settings: profile, version: 2 };
 }
 
 export function buildBackup(data, settings) {
+  const profile = profileFrom(settings);
   return {
     app: "HealthLog",
-    version: 1,
+    version: 2,
     exportedAt: new Date().toISOString(),
     data: {
-      labs: data.labs || [],
+      profile,
+      reports: data.reports || [],
+      results: data.results || [],
+      followups: data.followups || [],
+      customTests: data.customTests || [],
       bp: data.bp || [],
       weights: data.weights || [],
       glucose: data.glucose || [],
       meds: data.meds || [],
       visits: data.visits || [],
-      settings: settings || null,
     },
   };
 }
@@ -247,9 +436,10 @@ function csvCell(value) {
 
 export function toCsv(data) {
   const lines = [["type", "date", "name", "value", "unit", "detail", "notes"]];
-  (data.labs || []).forEach((row) => {
+  (data.results || []).forEach((row) => {
+    const shown = `${row.comparator || ""}${row.numeric ?? ""}${row.qualitative ? ` ${row.qualitative}` : ""}`.trim();
     const range = [row.refLow, row.refHigh].filter((n) => n != null).join("–") || row.refText || row.flag || "";
-    lines.push(["lab", row.date, row.testName, row.value, row.unit, range, row.notes]);
+    lines.push(["result", row.date, row.name || row.testId, shown, row.unit, range, row.notes]);
   });
   (data.bp || []).forEach((row) => {
     lines.push(["blood_pressure", row.date, "Blood pressure", `${row.systolic}/${row.diastolic}`, "mmHg", row.pulse ? `pulse ${row.pulse}` : "", row.notes]);
