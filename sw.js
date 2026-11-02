@@ -1,5 +1,5 @@
 /* HealthLog service worker. Bump CACHE when shipped files change. */
-const CACHE = "healthlog-v3";
+const CACHE = "healthlog-v4";
 
 const ASSETS = [
   "./",
@@ -16,6 +16,10 @@ const ASSETS = [
   "./js/ocr.js",
   "./js/sample.js",
   "./js/files.js",
+  "./js/id.js",
+  "./js/catalog.js",
+  "./js/match.js",
+  "./js/interpret.js",
   "./vendor/chart.umd.min.js",
   "./vendor/tesseract/tesseract.min.js",
   "./vendor/tesseract/worker.min.js",

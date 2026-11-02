@@ -518,6 +518,36 @@ pre.raw {
 
 details summary { font-weight: 700; min-height: 44px; display: flex; align-items: center; }
 
+.panel { background: var(--surface); border: 1px solid var(--line); border-radius: 16px; padding: 0 12px 8px; }
+.panel > summary { cursor: pointer; }
+.test-row, .entry-line { min-width: 0; }
+.test-row {
+  width: 100%;
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 4px 8px;
+  align-items: center;
+  min-height: 64px;
+  padding: 8px 0;
+  border: 0;
+  border-top: 1px solid var(--line);
+  background: transparent;
+  text-align: left;
+  color: inherit;
+}
+.spark { width: 72px; height: 28px; color: var(--accent); }
+.entry-line {
+  display: grid;
+  grid-template-columns: 76px minmax(0, 1fr) auto;
+  gap: 6px;
+  align-items: center;
+  padding: 8px 0;
+  border-top: 1px solid var(--line);
+}
+.entry-line .name { grid-column: 1 / -1; font-weight: 700; }
+.entry-line input, .entry-line select { min-height: 44px; width: 100%; border-radius: 10px; border: 1px solid var(--line); background: var(--surface); font-size: 16px; padding: 8px; }
+.check-miss { margin: 4px 0 0; color: var(--muted); font-size: 0.875rem; }
+
 .noscript {
   margin: 16px;
   padding: 16px;

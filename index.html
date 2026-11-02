@@ -38,6 +38,7 @@
         <div>
           <p class="eyebrow">On this device only</p>
           <h1>HealthLog</h1>
+          <p id="patient-name" data-testid="header-patient" hidden></p>
         </div>
       </div>
       <p class="disclaimer" data-testid="disclaimer">Not medical advice. Personal records and general education only.</p>
@@ -51,7 +52,7 @@
 
       <section id="view-add" data-view="add" hidden aria-label="Add">
         <div class="type-grid" role="group" aria-label="Record type">
-          <button type="button" data-type="lab" aria-pressed="true">Lab result</button>
+          <button type="button" data-type="report" aria-pressed="true">Screening report</button>
           <button type="button" data-type="bp" aria-pressed="false">Blood pressure</button>
           <button type="button" data-type="weight" aria-pressed="false">Weight</button>
           <button type="button" data-type="glucose" aria-pressed="false">Blood sugar</button>
@@ -59,30 +60,27 @@
           <button type="button" data-type="visit" aria-pressed="false">Doctor visit</button>
         </div>
 
-        <form id="form-lab" data-form="lab" data-testid="form-lab">
-          <label class="field">Test name<input name="testName" required autocomplete="off"></label>
+        <form id="form-report" data-form="report" data-testid="form-report">
+          <h2>New screening report</h2>
+          <p class="muted">Every test in the screening catalog is listed. Leave a row blank to skip it. A range you type here overrides the printed default for that result.</p>
+          <label class="field">Patient name<input name="patientName" id="report-patient" data-testid="report-patient" autocomplete="name"></label>
+          <label class="field">Date collected<input name="dateCollected" id="report-date" data-testid="report-date" type="date" required></label>
+          <label class="field">Lab<input name="lab" data-testid="report-lab" autocomplete="off" placeholder="Fictional lab name"></label>
           <div class="grid-2">
-            <label class="field">Value<input name="value" inputmode="decimal" step="any" required></label>
-            <label class="field">Unit<input name="unit" placeholder="mmol/L" autocomplete="off"></label>
+            <label class="field">Lab number<input name="labNumber" data-testid="report-number" autocomplete="off"></label>
+            <label class="field">Fasting
+              <select name="fasting" id="report-fasting" data-testid="report-fasting">
+                <option value="">Not set</option>
+                <option value="yes">Yes</option>
+                <option value="no">No</option>
+              </select>
+            </label>
           </div>
-          <div class="grid-2">
-            <label class="field">Reference low<input name="refLow" inputmode="decimal" step="any"></label>
-            <label class="field">Reference high<input name="refHigh" inputmode="decimal" step="any"></label>
-          </div>
-          <label class="field">Range as printed<input name="refPrinted" placeholder="4.0 - 5.6 or &lt; 5.2" autocomplete="off"></label>
-          <label class="field">Flag on the report
-            <select name="flag">
-              <option value="">None</option>
-              <option value="H">H — marked high</option>
-              <option value="L">L — marked low</option>
-            </select>
-          </label>
-          <label class="field">Date<input name="date" type="date" required></label>
-          <label class="field">Lab or clinic<input name="lab" autocomplete="off"></label>
+          <label class="field">Doctor or clinic<input name="doctor" data-testid="report-doctor" autocomplete="off"></label>
           <label class="field">Notes<textarea name="notes"></textarea></label>
+          <div id="report-fields"></div>
           <p class="form-error" role="alert" hidden></p>
-          <button type="submit" class="btn-primary" data-label="Save lab result" data-testid="save-lab">Save lab result</button>
-          <button type="button" class="btn-secondary" data-cancel-edit hidden>Cancel edit</button>
+          <button type="submit" class="btn-primary" data-testid="save-report">Save screening report</button>
         </form>
 
         <form id="form-bp" data-form="bp" data-testid="form-bp" hidden>
@@ -193,8 +191,20 @@
           <h2>Review before saving</h2>
           <p>Nothing is saved until you tap save. Fix names, values, units, and ranges first.</p>
           <p id="review-empty" class="muted" hidden>No rows were detected. Add them yourself, or edit the text and parse again.</p>
-          <label class="field">Report date<input id="review-date" data-testid="review-date" type="date"></label>
+          <label class="field">Patient name<input id="review-patient" data-testid="review-patient" autocomplete="name"></label>
+          <label class="field">Date collected<input id="review-date" data-testid="review-date" type="date"></label>
           <label class="field">Lab or clinic<input id="review-lab" data-testid="review-lab" autocomplete="off"></label>
+          <div class="grid-2">
+            <label class="field">Lab number<input id="review-number" data-testid="review-number" autocomplete="off"></label>
+            <label class="field">Fasting
+              <select id="review-fasting" data-testid="review-fasting">
+                <option value="">Not set</option>
+                <option value="yes">Yes</option>
+                <option value="no">No</option>
+              </select>
+            </label>
+          </div>
+          <label class="field">Doctor or clinic<input id="review-doctor" data-testid="review-doctor" autocomplete="off"></label>
           <div id="review-rows"></div>
           <button type="button" class="btn-secondary" id="add-row" data-testid="add-row">Add row</button>
           <button type="button" class="btn-primary" id="save-review" data-testid="save-review">Save results</button>
@@ -205,14 +215,12 @@
         </section>
       </section>
 
-      <section id="view-trends" data-view="trends" class="stack" hidden aria-label="Trends">
-        <div class="segment" role="group" aria-label="Time range">
-          <button type="button" data-range="3m" data-testid="range-3m">3m</button>
-          <button type="button" data-range="6m" data-testid="range-6m">6m</button>
-          <button type="button" data-range="1y" data-testid="range-1y" aria-pressed="true">1y</button>
-          <button type="button" data-range="all" data-testid="range-all">All</button>
-        </div>
-        <div id="trend-charts" class="stack" data-testid="trend-charts"></div>
+      <section id="view-panels" data-view="panels" class="stack" hidden aria-label="Panels">
+        <div id="panel-root"></div>
+      </section>
+      <section id="view-test" data-view="test" class="stack" hidden aria-label="Test history">
+        <button type="button" class="btn-ghost" id="test-back" data-testid="test-back">Back to panels</button>
+        <div id="test-root"></div>
       </section>
 
       <section id="view-more" data-view="more" class="stack" hidden aria-label="More">
@@ -242,6 +250,30 @@
           <label class="field">Height for BMI (cm)
             <input id="set-height" data-testid="set-height" inputmode="decimal" type="number" min="50" max="260" step="0.1">
           </label>
+          <label class="field">Patient name
+            <input id="set-name" data-testid="set-name" autocomplete="name" maxlength="120">
+          </label>
+          <label class="field">Sex
+            <select id="set-sex" data-testid="set-sex">
+              <option value="">Not set</option>
+              <option value="female">Female</option>
+              <option value="male">Male</option>
+            </select>
+          </label>
+          <label class="field">Date of birth
+            <input id="set-dob" data-testid="set-dob" type="date">
+          </label>
+          <label class="field">Cardiovascular-risk category
+            <select id="set-cvrisk" data-testid="set-cvrisk">
+              <option value="">Not set — use each report’s range</option>
+              <option value="low">Low</option>
+              <option value="moderate">Moderate</option>
+              <option value="high">High</option>
+              <option value="veryhigh">Very high</option>
+              <option value="recurrent">Recurrent events</option>
+            </select>
+          </label>
+          <p class="muted">Sex, date of birth, and risk category stay on this device. They only choose which printed age or sex table to show. They are not a diagnosis.</p>
         </article>
         <article class="card stack">
           <h2>Backup</h2>
@@ -278,9 +310,9 @@
         <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 8h3l1.5-2h7L17 8h3v11H4z"/><circle cx="12" cy="13.5" r="3.2"/></svg>
         <span>Scan</span>
       </button>
-      <button type="button" role="tab" data-tab="trends" aria-selected="false" data-testid="tab-trends">
-        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 16l5-5 3 3 8-8"/><path d="M4 20h16"/></svg>
-        <span>Trends</span>
+      <button type="button" role="tab" data-tab="panels" aria-selected="false" data-testid="tab-panels">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 5h7v6H4zM13 5h7v6h-7zM4 13h7v6H4zM13 13h7v6h-7z"/></svg>
+        <span>Panels</span>
       </button>
       <button type="button" role="tab" data-tab="more" aria-selected="false" data-testid="tab-more">
         <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="6" cy="12" r="1.6" fill="currentColor" stroke="none"/><circle cx="12" cy="12" r="1.6" fill="currentColor" stroke="none"/><circle cx="18" cy="12" r="1.6" fill="currentColor" stroke="none"/></svg>

@@ -115,7 +115,12 @@ export function canonicalUnit(unit) {
     "x1012/l": "x10^12/L",
     "10^12/l": "x10^12/L",
     "ml/min": "mL/min",
-    "ml/min/1.73m2": "mL/min",
+    "ml/min/1.73m2": "mL/min/1.73m2",
+    "l/l": "L/L",
+    "au/ml": "AU/mL",
+    "mmol/mol": "mmol/mol",
+    index: "index",
+    ratio: "ratio",
   };
   return map[key] || String(unit).trim();
 }
